@@ -1,0 +1,16 @@
+services:
+  redis:
+    image: redis:alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  rmq-test:
+    build: .
+    depends_on:
+      - redis
+    environment:
+      REDIS_URL: "redis://redis:6379"
+    command: cargo test --release
