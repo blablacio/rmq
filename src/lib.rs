@@ -1,3 +1,4 @@
+pub mod builder;
 pub mod consumer;
 pub mod delivery;
 pub mod options;

@@ -4,6 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 use eyre::Result;
 use fred::prelude::{Client, ClientLike, Config, KeysInterface, StreamsInterface};
+use rmq::builder::QueueBuilder;
 use rmq::{Consumer, Delivery, Queue, QueueOptions, RetryConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,20 +66,20 @@ impl Consumer for FlakyConsumer {
 
 #[tokio::test]
 async fn test_manual_queue_basic_flow() -> Result<()> {
+    // Demonstrate: Using the Builder with an existing `fred::Client`.
     let config = Config::from_url(&get_redis_url())?;
-    let client = Client::new(config, None, None, None);
-    client.connect();
-    client.wait_for_connect().await?;
-    let client = Arc::new(client);
+    let raw_client = Client::new(config, None, None, None);
+    raw_client.connect();
+    raw_client.wait_for_connect().await?;
+    let arc_client = Arc::new(raw_client);
 
-    let options = QueueOptions::default(); // No pending_timeout => manual queue
-    let queue = Queue::<TestMessage>::new(
-        client.clone(),
-        "manual_test_stream".to_string(),
-        Some("manual_group".to_string()),
-        options,
-    )
-    .await?;
+    // Build using our custom QueueBuilder (but inject the existing client)
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(arc_client.clone())
+        .stream("manual_test_stream")
+        .group("manual_group")
+        .build()
+        .await?;
 
     let received_messages = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let consumer = TestAcknowledgeConsumer {
@@ -99,30 +100,30 @@ async fn test_manual_queue_basic_flow() -> Result<()> {
     assert_eq!(msgs[0].content, "Hello Manual");
 
     // Cleanup
-    client
+    arc_client
         .xgroup_destroy::<String, _, _>("manual_test_stream", "manual_group")
         .await?;
-    client.del::<String, _>("manual_test_stream").await?;
+    arc_client.del::<String, _>("manual_test_stream").await?;
     Ok(())
 }
 
 #[tokio::test]
 async fn test_stealing_queue_basic_flow() -> Result<()> {
+    // Demonstrate: Using direct Queue::new(...) with a `fred::Client`.
     let config = Config::from_url(&get_redis_url())?;
     let client = Client::new(config, None, None, None);
     client.connect();
     client.wait_for_connect().await?;
     let client = Arc::new(client);
 
-    // Set a pending_timeout, making it a stealing queue
+    // Stealing queue
     let options = QueueOptions {
-        pending_timeout: Some(2000), // 2 seconds
+        pending_timeout: Some(2000),
         retry_config: None,
         poll_interval: Some(100),
         enable_dlq: false,
         dlq_name: None,
     };
-
     let queue = Queue::<TestMessage>::new(
         client.clone(),
         "stealing_test_stream".to_string(),
@@ -158,7 +159,6 @@ async fn test_stealing_queue_basic_flow() -> Result<()> {
     let msgs1 = received1.lock().await;
     let msgs2 = received2.lock().await;
     let total = msgs1.len() + msgs2.len();
-    // All messages should be processed by now, possibly stolen if one consumer lagged.
     assert_eq!(total, 5, "Not all messages were processed");
 
     // Cleanup
@@ -171,30 +171,25 @@ async fn test_stealing_queue_basic_flow() -> Result<()> {
 
 #[tokio::test]
 async fn test_stealing_queue_retry_behavior() -> Result<()> {
-    let config = Config::from_url(&get_redis_url())?;
-    let client = Client::new(config, None, None, None);
-    client.connect();
-    client.wait_for_connect().await?;
-    let client = Arc::new(client);
-
+    // Demonstrate: Using the Builder with a Redis URL (no prebuilt client).
     let options = QueueOptions {
         pending_timeout: Some(500),
         retry_config: Some(RetryConfig {
             max_retries: 3,
-            retry_delay: 0, // no delay for simplicity
+            retry_delay: 0,
         }),
         poll_interval: Some(100),
         enable_dlq: false,
         dlq_name: None,
     };
 
-    let queue = Queue::<TestMessage>::new(
-        client.clone(),
-        "retry_test_stream".to_string(),
-        Some("retry_group".to_string()),
-        options,
-    )
-    .await?;
+    let queue = QueueBuilder::<TestMessage>::new()
+        .url(&get_redis_url())
+        .stream("retry_test_stream")
+        .group("retry_group")
+        .options(options)
+        .build()
+        .await?;
 
     let attempts = Arc::new(tokio::sync::Mutex::new(0));
     let consumer = FlakyConsumer {
@@ -208,13 +203,13 @@ async fn test_stealing_queue_retry_behavior() -> Result<()> {
     };
     queue.produce(&msg).await?;
 
-    // Wait enough time for all retries
     sleep(Duration::from_secs(3)).await;
 
     let c = *attempts.lock().await;
     assert_eq!(c, 4, "Expected 4 attempts: initial + 3 retries");
 
     // Cleanup
+    let client = queue.client().clone(); // if you add a .client() getter to your Queue
     client
         .xgroup_destroy::<String, _, _>("retry_test_stream", "retry_group")
         .await?;
@@ -224,19 +219,16 @@ async fn test_stealing_queue_retry_behavior() -> Result<()> {
 
 #[tokio::test]
 async fn test_handling_invalid_messages() -> Result<()> {
-    let config = Config::from_url(&get_redis_url())?;
-    let client = Client::new(config, None, None, None);
-    client.connect();
-    client.wait_for_connect().await?;
-    let client = Arc::new(client);
-
-    let queue = Queue::<TestMessage>::new(
-        client.clone(),
-        "invalid_test_stream".to_string(),
-        Some("invalid_group".to_string()),
+    // Demonstrate: Using the optional `Queue::from_url(...)` helper method.
+    let queue = Queue::<TestMessage>::from_url(
+        &get_redis_url(),
+        "invalid_test_stream",
+        Some("invalid_group"),
         QueueOptions::default(),
     )
     .await?;
+
+    let client = queue.client().clone(); // If you add a public getter or store the client
 
     let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let consumer = TestAcknowledgeConsumer {
@@ -256,7 +248,6 @@ async fn test_handling_invalid_messages() -> Result<()> {
         .await?;
 
     sleep(Duration::from_secs(2)).await;
-
     let msgs = received.lock().await;
     assert_eq!(msgs.len(), 1, "Only the valid message should be processed");
     assert_eq!(msgs[0].content, "ValidMsg");

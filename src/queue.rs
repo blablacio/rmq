@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use eyre::Result;
 use fred::{
     error::Error,
-    prelude::{Client, ClientLike, LuaInterface, StreamsInterface},
+    prelude::{Client, ClientLike, Config, LuaInterface, StreamsInterface},
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -86,6 +86,32 @@ where
             tasks: Arc::new(DashMap::new()),
             marker: PhantomData,
         })
+    }
+
+    pub async fn from_url(
+        url: &str,
+        stream: &str,
+        group: Option<&str>,
+        options: QueueOptions,
+    ) -> Result<Self> {
+        // Initialize client from config
+        let config = Config::from_url(url)?;
+        let client = Arc::new(Client::new(config, None, None, None));
+        // Connect client
+        client.connect();
+        client.wait_for_connect().await?;
+
+        Self::new(
+            client,
+            stream.to_string(),
+            group.map(|s| s.to_string()),
+            options,
+        )
+        .await
+    }
+
+    pub fn client(&self) -> Arc<Client> {
+        self.client.clone()
     }
 
     pub async fn shutdown(&self, shutdown_timeout: Option<u64>) {
