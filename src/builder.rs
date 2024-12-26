@@ -1,9 +1,11 @@
-use eyre::{eyre, Result};
 use fred::prelude::{Client, ClientLike, Config};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{marker::PhantomData, sync::Arc};
 
-use crate::{Queue, QueueOptions, RetryConfig};
+use crate::{
+    errors::{RmqError, RmqResult},
+    Queue, QueueOptions, RetryConfig,
+};
 
 pub struct QueueBuilder<M> {
     url: Option<String>,
@@ -94,17 +96,19 @@ where
     }
 
     /// Finally build the queue.
-    pub async fn build(self) -> Result<Queue<M>> {
-        let stream = self.stream.ok_or_else(|| eyre!("`stream` not specified"))?;
+    pub async fn build(self) -> RmqResult<Queue<M>> {
+        let stream = self
+            .stream
+            .ok_or_else(|| RmqError::ConfigError("`stream` not specified".to_string()))?;
         let group = self.group;
         let options = self.options;
 
         let client = match self.client {
             Some(c) => c,
             None => {
-                let url = self
-                    .url
-                    .ok_or_else(|| eyre!("No Redis client or URL provided"))?;
+                let url = self.url.ok_or_else(|| {
+                    RmqError::ConfigError("No Redis client or URL provided".to_string())
+                })?;
                 let config = Config::from_url(&url)?;
                 let new_client = Arc::new(Client::new(config, None, None, None));
                 new_client.connect();

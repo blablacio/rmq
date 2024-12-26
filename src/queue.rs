@@ -1,7 +1,6 @@
 use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
-use eyre::Result;
 use fred::{
     error::Error,
     prelude::{Client, ClientLike, Config, LuaInterface, StreamsInterface},
@@ -9,17 +8,14 @@ use fred::{
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use tokio::{
-    sync::{
-        watch::{self, Receiver, Sender},
-        Mutex,
-    },
+    sync::watch::{self, Receiver, Sender},
     task::JoinHandle,
     time::{sleep, timeout},
 };
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use crate::{consumer::Consumer, delivery::Delivery, options::QueueOptions};
+use crate::{consumer::Consumer, delivery::Delivery, errors::RmqResult, options::QueueOptions};
 
 #[derive(Clone)]
 pub struct Queue<M> {
@@ -43,7 +39,7 @@ where
         stream: String,
         group: Option<String>,
         options: QueueOptions,
-    ) -> Result<Self> {
+    ) -> RmqResult<Self> {
         let group = group.unwrap_or_else(|| "default_group".to_string());
 
         // Only create the group if group_name is provided
@@ -93,7 +89,7 @@ where
         stream: &str,
         group: Option<&str>,
         options: QueueOptions,
-    ) -> Result<Self> {
+    ) -> RmqResult<Self> {
         // Initialize client from config
         let config = Config::from_url(url)?;
         let client = Arc::new(Client::new(config, None, None, None));
@@ -173,7 +169,7 @@ where
         }
     }
 
-    pub async fn register_consumer<C>(&self, consumer: C) -> Result<Uuid>
+    pub async fn register_consumer<C>(&self, consumer: C) -> RmqResult<Uuid>
     where
         C: Consumer<Message = M>,
     {
@@ -190,7 +186,7 @@ where
     async fn start_consumer(
         &self,
         consumer: Arc<dyn Consumer<Message = M>>,
-    ) -> Result<JoinHandle<()>> {
+    ) -> RmqResult<JoinHandle<()>> {
         let client = self.client.clone();
         let stream = self.stream.clone();
         let group = self.group.clone();
@@ -215,7 +211,7 @@ where
     }
 
     // Produce a message to the queue (Redis Stream)
-    pub async fn produce(&self, message: &M) -> Result<()> {
+    pub async fn produce(&self, message: &M) -> RmqResult<()> {
         let msg = serde_json::to_string(message)?;
 
         self.client
@@ -305,19 +301,16 @@ where
         if let Some(data) = fields.get("data") {
             match serde_json::from_value::<M>(data.clone()) {
                 Ok(message) => {
-                    let mut delivery = Delivery {
-                        client: client.clone(),
-                        stream: stream.to_string(),
-                        group: group.to_string(),
-                        consumer_id: consumer_id.clone(),
-                        message_id: message_id.clone(),
+                    let delivery = Delivery::new(
+                        client.clone(),
+                        stream.to_string(),
+                        group.to_string(),
+                        consumer_id.clone(),
+                        message_id.clone(),
                         message,
-                        max_retries: options.max_retries(),
+                        options.max_retries(),
                         retry_count,
-                        error: None,
-                        keep_alive_handle: Arc::new(Mutex::new(None)),
-                        keep_alive_stop: None,
-                    };
+                    );
 
                     // If this is a manual queue (no pending_timeout), start keep-alive
                     if options.pending_timeout.is_none() {
@@ -325,7 +318,7 @@ where
                     }
 
                     loop {
-                        let result = consumer.process(&mut delivery).await;
+                        let result = consumer.process(&delivery).await;
 
                         match result {
                             Ok(_) => {
@@ -337,8 +330,13 @@ where
                                 break;
                             }
                             Err(e) => {
-                                error!("Error processing message {}: {}", message_id, e);
-                                delivery.error = Some(e.to_string());
+                                error!(
+                                    "Error processing message {}: {}",
+                                    message_id,
+                                    e.to_string()
+                                );
+
+                                delivery.set_error(e.clone()).await;
 
                                 let should_retry = consumer.should_retry(&delivery).await;
 
@@ -347,7 +345,7 @@ where
                                     if options.pending_timeout.is_none() {
                                         // Manual queue with retries: We handle retry in-process
                                         // Increase retry_count after a failed attempt
-                                        delivery.retry_count += 1;
+                                        delivery.inc_retry_count();
 
                                         // Sleep if retry_delay is specified in retry_config
                                         if options.retry_delay() > 0 {
@@ -367,10 +365,7 @@ where
                                     // should_retry = false
                                     if options.enable_dlq {
                                         // Move the message to the Dead-Letter Queue
-                                        let dlq_stream = options
-                                            .dlq_name
-                                            .clone()
-                                            .unwrap_or_else(|| "dead_letter_stream".to_string());
+                                        let dlq_stream = options.dlq_name();
 
                                         if let Err(e) = client
                                             .xadd::<String, _, _, _, _>(

@@ -6,8 +6,7 @@ edition = "2021"
 [dependencies]
 async-trait = "0.1.83"
 dashmap = "6.1.0"
-eyre = "0.6.12"
-fred = { version = "10.0.1", features = [
+fred = { version = "10.0.2", features = [
     "default-nil-types",
     "enable-rustls-ring",
     "i-cluster",
@@ -16,8 +15,9 @@ fred = { version = "10.0.1", features = [
     "serde-json",
     "sha-1",
 ] }
-serde = { version = "1.0.216", features = ["derive"] }
-serde_json = "1.0.133"
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.134"
+thiserror = "2.0.9"
 tokio = { version = "1.42.0", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["json", "env-filter"] }
@@ -29,4 +29,5 @@ uuid = { version = "1.11.0", features = [
 ] }
 
 [dev-dependencies]
+eyre = "0.6.12"
 rand = "0.8.5"

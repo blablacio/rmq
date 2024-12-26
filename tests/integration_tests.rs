@@ -1,14 +1,10 @@
-use std::time::Duration;
-use std::{collections::HashMap, sync::Arc};
-
 use async_trait::async_trait;
-use eyre::Result;
 use fred::prelude::{Client, ClientLike, Config, KeysInterface, StreamsInterface};
-use rmq::builder::QueueBuilder;
-use rmq::{Consumer, Delivery, Queue, QueueOptions, RetryConfig};
+use rmq::{Consumer, ConsumerError, Delivery, Queue, QueueBuilder, QueueOptions, RetryConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::time::sleep;
+use std::{collections::HashMap, error::Error, fmt, sync::Arc, time::Duration};
+use tokio::{sync::Mutex, time::sleep};
 
 fn get_redis_url() -> String {
     std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string())
@@ -20,16 +16,27 @@ struct TestMessage {
     content: String,
 }
 
+#[derive(Debug)]
+struct TestError(String);
+
+impl fmt::Display for TestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Error for TestError {}
+
 /// A simple consumer that records received messages and always acknowledges them.
 struct TestAcknowledgeConsumer {
-    received_messages: Arc<tokio::sync::Mutex<Vec<TestMessage>>>,
+    received_messages: Arc<Mutex<Vec<TestMessage>>>,
 }
 
 #[async_trait]
 impl Consumer for TestAcknowledgeConsumer {
     type Message = TestMessage;
 
-    async fn process(&self, delivery: &mut Delivery<Self::Message>) -> Result<()> {
+    async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
         let mut msgs = self.received_messages.lock().await;
         msgs.push(delivery.message.clone());
         delivery.ack().await?; // Always ack
@@ -37,35 +44,8 @@ impl Consumer for TestAcknowledgeConsumer {
     }
 }
 
-/// A flaky consumer that fails a certain number of times before succeeding.
-struct FlakyConsumer {
-    attempts: Arc<tokio::sync::Mutex<u32>>,
-    fail_up_to: u32,
-}
-
-#[async_trait]
-impl Consumer for FlakyConsumer {
-    type Message = TestMessage;
-
-    async fn process(&self, delivery: &mut Delivery<Self::Message>) -> Result<()> {
-        let mut attempts = self.attempts.lock().await;
-        *attempts += 1;
-        if *attempts <= self.fail_up_to {
-            Err(eyre::eyre!("Simulated failure"))
-        } else {
-            delivery.ack().await?;
-            Ok(())
-        }
-    }
-
-    async fn should_retry(&self, delivery: &Delivery<Self::Message>) -> bool {
-        // Retry as long as we haven't reached fail_up_to attempts
-        delivery.retry_count < self.fail_up_to
-    }
-}
-
 #[tokio::test]
-async fn test_manual_queue_basic_flow() -> Result<()> {
+async fn test_manual_queue_basic_flow() -> eyre::Result<()> {
     // Demonstrate: Using the Builder with an existing `fred::Client`.
     let config = Config::from_url(&get_redis_url())?;
     let raw_client = Client::new(config, None, None, None);
@@ -81,7 +61,7 @@ async fn test_manual_queue_basic_flow() -> Result<()> {
         .build()
         .await?;
 
-    let received_messages = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let received_messages = Arc::new(Mutex::new(Vec::new()));
     let consumer = TestAcknowledgeConsumer {
         received_messages: received_messages.clone(),
     };
@@ -108,7 +88,7 @@ async fn test_manual_queue_basic_flow() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_stealing_queue_basic_flow() -> Result<()> {
+async fn test_stealing_queue_basic_flow() -> eyre::Result<()> {
     // Demonstrate: Using direct Queue::new(...) with a `fred::Client`.
     let config = Config::from_url(&get_redis_url())?;
     let client = Client::new(config, None, None, None);
@@ -132,12 +112,12 @@ async fn test_stealing_queue_basic_flow() -> Result<()> {
     )
     .await?;
 
-    let received1 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let received1 = Arc::new(Mutex::new(Vec::new()));
     let consumer1 = TestAcknowledgeConsumer {
         received_messages: received1.clone(),
     };
 
-    let received2 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let received2 = Arc::new(Mutex::new(Vec::new()));
     let consumer2 = TestAcknowledgeConsumer {
         received_messages: received2.clone(),
     };
@@ -170,7 +150,34 @@ async fn test_stealing_queue_basic_flow() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_stealing_queue_retry_behavior() -> Result<()> {
+async fn test_stealing_queue_retry_behavior() -> eyre::Result<()> {
+    /// A flaky consumer that fails a certain number of times before succeeding.
+    struct FlakyConsumer {
+        attempts: Arc<Mutex<u32>>,
+        fail_up_to: u32,
+    }
+
+    #[async_trait]
+    impl Consumer for FlakyConsumer {
+        type Message = TestMessage;
+
+        async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
+            let mut attempts = self.attempts.lock().await;
+            *attempts += 1;
+            if *attempts <= self.fail_up_to {
+                Err(ConsumerError::new(TestError("Simulated failure".into())))
+            } else {
+                delivery.ack().await?;
+                Ok(())
+            }
+        }
+
+        async fn should_retry(&self, delivery: &Delivery<Self::Message>) -> bool {
+            // Retry as long as we haven't reached fail_up_to attempts
+            delivery.retry_count() < self.fail_up_to
+        }
+    }
+
     // Demonstrate: Using the Builder with a Redis URL (no prebuilt client).
     let options = QueueOptions {
         pending_timeout: Some(500),
@@ -191,7 +198,7 @@ async fn test_stealing_queue_retry_behavior() -> Result<()> {
         .build()
         .await?;
 
-    let attempts = Arc::new(tokio::sync::Mutex::new(0));
+    let attempts = Arc::new(Mutex::new(0));
     let consumer = FlakyConsumer {
         attempts: attempts.clone(),
         fail_up_to: 3,
@@ -218,7 +225,7 @@ async fn test_stealing_queue_retry_behavior() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_handling_invalid_messages() -> Result<()> {
+async fn test_handling_invalid_messages() -> eyre::Result<()> {
     // Demonstrate: Using the optional `Queue::from_url(...)` helper method.
     let queue = Queue::<TestMessage>::from_url(
         &get_redis_url(),
@@ -230,7 +237,7 @@ async fn test_handling_invalid_messages() -> Result<()> {
 
     let client = queue.client().clone(); // If you add a public getter or store the client
 
-    let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let received = Arc::new(Mutex::new(Vec::new()));
     let consumer = TestAcknowledgeConsumer {
         received_messages: received.clone(),
     };
@@ -261,7 +268,7 @@ async fn test_handling_invalid_messages() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_queue_graceful_shutdown() -> Result<()> {
+async fn test_queue_graceful_shutdown() -> eyre::Result<()> {
     let config = Config::from_url(&get_redis_url())?;
     let client = Client::new(config, None, None, None);
     client.connect();
@@ -276,7 +283,7 @@ async fn test_queue_graceful_shutdown() -> Result<()> {
     )
     .await?;
 
-    let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let received = Arc::new(Mutex::new(Vec::new()));
     let consumer = TestAcknowledgeConsumer {
         received_messages: received.clone(),
     };
@@ -312,7 +319,7 @@ async fn test_queue_graceful_shutdown() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_default_no_retry_behavior() -> Result<()> {
+async fn test_default_no_retry_behavior() -> eyre::Result<()> {
     // This test checks that with no retry_config and no override of should_retry(), no retries occur.
     // The message should fail once and never be attempted again.
 
@@ -334,27 +341,29 @@ async fn test_default_no_retry_behavior() -> Result<()> {
 
     // A consumer that fails once
     struct FailOnceConsumer {
-        attempted: Arc<tokio::sync::Mutex<bool>>,
+        attempted: Arc<Mutex<bool>>,
     }
 
     #[async_trait]
     impl Consumer for FailOnceConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, _delivery: &mut Delivery<Self::Message>) -> Result<()> {
+        async fn process(&self, _delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
             let mut attempted = self.attempted.lock().await;
             if !*attempted {
                 *attempted = true;
-                Err(eyre::eyre!("First attempt fails"))
+                Err(ConsumerError::new(TestError("First attempt fails".into())))
             } else {
                 // If it were retried, we'd see this. But we won't.
-                Err(eyre::eyre!("Should never see second attempt"))
+                Err(ConsumerError::new(TestError(
+                    "Should never see second attempt".into(),
+                )))
             }
         }
     }
 
     let fail_consumer = FailOnceConsumer {
-        attempted: Arc::new(tokio::sync::Mutex::new(false)),
+        attempted: Arc::new(Mutex::new(false)),
     };
     queue.register_consumer(fail_consumer).await?;
 
@@ -384,7 +393,7 @@ async fn test_default_no_retry_behavior() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_retry_override_without_retry_config() -> Result<()> {
+async fn test_retry_override_without_retry_config() -> eyre::Result<()> {
     // This test checks that without a retry_config, but with a consumer-defined `should_retry()` that
     // always returns true, the message keeps being retried. However, to actually see multiple attempts,
     // we need `pending_timeout` so the message can be reclaimed after failure.
@@ -413,17 +422,17 @@ async fn test_retry_override_without_retry_config() -> Result<()> {
 
     // A consumer that always fails and always returns true in should_retry().
     struct AlwaysRetryConsumer {
-        attempts: Arc<tokio::sync::Mutex<u32>>,
+        attempts: Arc<Mutex<u32>>,
     }
 
     #[async_trait]
     impl Consumer for AlwaysRetryConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, _delivery: &mut Delivery<Self::Message>) -> Result<()> {
+        async fn process(&self, _delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
             let mut att = self.attempts.lock().await;
             *att += 1;
-            Err(eyre::eyre!("I always fail"))
+            Err(ConsumerError::new(TestError("I always fail".into())))
         }
 
         async fn should_retry(&self, _delivery: &Delivery<Self::Message>) -> bool {
@@ -431,7 +440,7 @@ async fn test_retry_override_without_retry_config() -> Result<()> {
         }
     }
 
-    let attempts = Arc::new(tokio::sync::Mutex::new(0));
+    let attempts = Arc::new(Mutex::new(0));
     let cons = AlwaysRetryConsumer {
         attempts: attempts.clone(),
     };
@@ -469,7 +478,7 @@ async fn test_retry_override_without_retry_config() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_default_retry_behavior_with_config() -> Result<()> {
+async fn test_default_retry_behavior_with_config() -> eyre::Result<()> {
     // With a retry_config and no override, we rely on the default should_retry().
     // We'll fail a certain number of times and confirm it stops retrying after max_retries.
 
@@ -500,18 +509,21 @@ async fn test_default_retry_behavior_with_config() -> Result<()> {
 
     // Consumer that fails until attempts > 3 (initial + 2 retries = 3 attempts total)
     struct CountingConsumer {
-        attempts: Arc<tokio::sync::Mutex<u32>>,
+        attempts: Arc<Mutex<u32>>,
     }
 
     #[async_trait]
     impl Consumer for CountingConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, delivery: &mut Delivery<Self::Message>) -> Result<()> {
+        async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
             let mut att = self.attempts.lock().await;
             *att += 1;
             if *att <= 3 {
-                Err(eyre::eyre!("fail attempt {}", *att))
+                Err(ConsumerError::new(TestError(format!(
+                    "fail attempt {}",
+                    *att
+                ))))
             } else {
                 delivery.ack().await?;
                 Ok(())
@@ -519,7 +531,7 @@ async fn test_default_retry_behavior_with_config() -> Result<()> {
         }
     }
 
-    let attempts = Arc::new(tokio::sync::Mutex::new(0));
+    let attempts = Arc::new(Mutex::new(0));
     let cons = CountingConsumer {
         attempts: attempts.clone(),
     };
@@ -555,7 +567,7 @@ async fn test_default_retry_behavior_with_config() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_retry_override_ignores_retry_config() -> Result<()> {
+async fn test_retry_override_ignores_retry_config() -> eyre::Result<()> {
     // If retry_config is present but the consumer override returns false,
     // then no retries should happen.
 
@@ -585,17 +597,17 @@ async fn test_retry_override_ignores_retry_config() -> Result<()> {
 
     // Consumer always fails and always returns false for should_retry()
     struct NoRetryConsumer {
-        attempts: Arc<tokio::sync::Mutex<u32>>,
+        attempts: Arc<Mutex<u32>>,
     }
 
     #[async_trait]
     impl Consumer for NoRetryConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, _delivery: &mut Delivery<Self::Message>) -> Result<()> {
+        async fn process(&self, _delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
             let mut att = self.attempts.lock().await;
             *att += 1;
-            Err(eyre::eyre!("fail always"))
+            Err(ConsumerError::new(TestError("fail always".into())))
         }
 
         async fn should_retry(&self, _delivery: &Delivery<Self::Message>) -> bool {
@@ -603,7 +615,7 @@ async fn test_retry_override_ignores_retry_config() -> Result<()> {
         }
     }
 
-    let attempts = Arc::new(tokio::sync::Mutex::new(0));
+    let attempts = Arc::new(Mutex::new(0));
     let cons = NoRetryConsumer {
         attempts: attempts.clone(),
     };
@@ -638,7 +650,7 @@ async fn test_retry_override_ignores_retry_config() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_manual_queue_retries_until_success() -> Result<()> {
+async fn test_manual_queue_retries_until_success() -> Result<(), Box<dyn Error>> {
     // In this test:
     // - We have no `pending_timeout`, making this a manual queue.
     // - We supply a `retry_config` with max_retries = 3.
@@ -673,27 +685,53 @@ async fn test_manual_queue_retries_until_success() -> Result<()> {
     )
     .await?;
 
+    #[derive(Debug, Clone)]
+    struct CustomConsumerError(String);
+
+    impl fmt::Display for CustomConsumerError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl Error for CustomConsumerError {}
+
     struct EventuallySucceedsConsumer {
-        attempts: Arc<tokio::sync::Mutex<u32>>,
+        attempts: Arc<Mutex<u32>>,
     }
 
     #[async_trait]
     impl Consumer for EventuallySucceedsConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, _delivery: &mut Delivery<Self::Message>) -> Result<()> {
+        async fn process(&self, _delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
             let mut att = self.attempts.lock().await;
             *att += 1;
             if *att <= 2 {
-                Err(eyre::eyre!("fail attempt {}", *att))
+                Err(ConsumerError::new(CustomConsumerError(format!(
+                    "fail attempt {}",
+                    *att
+                ))))
             } else {
                 // On the 3rd attempt (initial + 2 retries = 3rd), succeed
                 Ok(())
             }
         }
+
+        async fn should_retry(&self, delivery: &Delivery<Self::Message>) -> bool {
+            if let Some(e) = delivery.error().await {
+                if let Some(e) = e.source() {
+                    if e.is::<CustomConsumerError>() {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
     }
 
-    let attempts = Arc::new(tokio::sync::Mutex::new(0));
+    let attempts = Arc::new(Mutex::new(0));
     let consumer = EventuallySucceedsConsumer {
         attempts: attempts.clone(),
     };
@@ -728,7 +766,7 @@ async fn test_manual_queue_retries_until_success() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_manual_queue_exhaust_retries() -> Result<()> {
+async fn test_manual_queue_exhaust_retries() -> eyre::Result<()> {
     // In this test:
     // - Manual queue (no pending_timeout).
     // - retry_config with max_retries = 2.
@@ -763,21 +801,21 @@ async fn test_manual_queue_exhaust_retries() -> Result<()> {
     .await?;
 
     struct AlwaysFailConsumer {
-        attempts: Arc<tokio::sync::Mutex<u32>>,
+        attempts: Arc<Mutex<u32>>,
     }
 
     #[async_trait]
     impl Consumer for AlwaysFailConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, _delivery: &mut Delivery<Self::Message>) -> Result<()> {
+        async fn process(&self, _delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
             let mut att = self.attempts.lock().await;
             *att += 1;
-            Err(eyre::eyre!("Always fail"))
+            Err(ConsumerError::new(TestError("Always fail".into())))
         }
     }
 
-    let attempts = Arc::new(tokio::sync::Mutex::new(0));
+    let attempts = Arc::new(Mutex::new(0));
     let consumer = AlwaysFailConsumer {
         attempts: attempts.clone(),
     };
@@ -840,23 +878,28 @@ async fn test_idempotent_processing() -> eyre::Result<()> {
     )
     .await?;
 
-    let global_counter = Arc::new(tokio::sync::Mutex::new(0));
+    let global_counter = Arc::new(Mutex::new(0));
 
     struct IdempotentConsumer {
-        attempts: Arc<tokio::sync::Mutex<u32>>,
-        global_counter: Arc<tokio::sync::Mutex<u32>>,
+        attempts: Arc<Mutex<u32>>,
+        global_counter: Arc<Mutex<u32>>,
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl Consumer for IdempotentConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, _delivery: &mut Delivery<Self::Message>) -> eyre::Result<()> {
+        async fn process(
+            &self,
+            _delivery: &Delivery<Self::Message>,
+        ) -> eyre::Result<(), ConsumerError> {
             let mut att = self.attempts.lock().await;
             *att += 1;
             if *att <= 2 {
                 // Fail first two attempts
-                Err(eyre::eyre!("Fail attempt {}", *att))
+                Err(ConsumerError::new(TestError(
+                    format!("Fail attempt {}", *att).into(),
+                )))
             } else {
                 // On success, increment the global counter once
                 let mut counter = self.global_counter.lock().await;
@@ -866,7 +909,7 @@ async fn test_idempotent_processing() -> eyre::Result<()> {
         }
     }
 
-    let attempts = Arc::new(tokio::sync::Mutex::new(0));
+    let attempts = Arc::new(Mutex::new(0));
     let consumer = IdempotentConsumer {
         attempts: attempts.clone(),
         global_counter: global_counter.clone(),
@@ -927,17 +970,20 @@ async fn test_infinite_retry_loop_in_stealing_queue() -> eyre::Result<()> {
     .await?;
 
     struct InfiniteRetryConsumer {
-        attempts: Arc<tokio::sync::Mutex<u32>>,
+        attempts: Arc<Mutex<u32>>,
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl Consumer for InfiniteRetryConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, _delivery: &mut Delivery<Self::Message>) -> eyre::Result<()> {
+        async fn process(
+            &self,
+            _delivery: &Delivery<Self::Message>,
+        ) -> eyre::Result<(), ConsumerError> {
             let mut att = self.attempts.lock().await;
             *att += 1;
-            Err(eyre::eyre!("Always fail"))
+            Err(ConsumerError::new(TestError("Always fail".into())))
         }
 
         async fn should_retry(&self, _delivery: &Delivery<Self::Message>) -> bool {
@@ -945,7 +991,7 @@ async fn test_infinite_retry_loop_in_stealing_queue() -> eyre::Result<()> {
         }
     }
 
-    let attempts = Arc::new(tokio::sync::Mutex::new(0));
+    let attempts = Arc::new(Mutex::new(0));
     let consumer = InfiniteRetryConsumer {
         attempts: attempts.clone(),
     };
@@ -1005,18 +1051,23 @@ async fn test_long_delay_high_retry_manual_queue() -> eyre::Result<()> {
     .await?;
 
     struct LateSuccessConsumer {
-        attempts: Arc<tokio::sync::Mutex<u32>>,
+        attempts: Arc<Mutex<u32>>,
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl Consumer for LateSuccessConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, delivery: &mut Delivery<Self::Message>) -> eyre::Result<()> {
+        async fn process(
+            &self,
+            delivery: &Delivery<Self::Message>,
+        ) -> eyre::Result<(), ConsumerError> {
             let mut att = self.attempts.lock().await;
             *att += 1;
             if *att < 50 {
-                Err(eyre::eyre!("Fail attempt {}", *att))
+                Err(ConsumerError::new(TestError(
+                    format!("Fail attempt {}", *att).into(),
+                )))
             } else {
                 delivery.ack().await?;
                 Ok(())
@@ -1024,7 +1075,7 @@ async fn test_long_delay_high_retry_manual_queue() -> eyre::Result<()> {
         }
     }
 
-    let attempts = Arc::new(tokio::sync::Mutex::new(0));
+    let attempts = Arc::new(Mutex::new(0));
     let consumer = LateSuccessConsumer {
         attempts: attempts.clone(),
     };
@@ -1083,11 +1134,14 @@ async fn test_consumer_panic_handling() -> eyre::Result<()> {
 
     struct PanicConsumer;
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl Consumer for PanicConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, _delivery: &mut Delivery<Self::Message>) -> eyre::Result<()> {
+        async fn process(
+            &self,
+            _delivery: &Delivery<Self::Message>,
+        ) -> eyre::Result<(), ConsumerError> {
             panic!("Simulated panic in process!");
         }
     }
@@ -1147,18 +1201,23 @@ async fn test_time_based_retry_logic() -> eyre::Result<()> {
 
     struct TimeBasedRetryConsumer {
         start: std::time::Instant,
-        attempts: Arc<tokio::sync::Mutex<u32>>,
+        attempts: Arc<Mutex<u32>>,
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl Consumer for TimeBasedRetryConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, _delivery: &mut Delivery<Self::Message>) -> eyre::Result<()> {
+        async fn process(
+            &self,
+            _delivery: &Delivery<Self::Message>,
+        ) -> eyre::Result<(), ConsumerError> {
             let mut att = self.attempts.lock().await;
             *att += 1;
             if *att < 5 {
-                Err(eyre::eyre!("fail attempt {}", *att))
+                Err(ConsumerError::new(TestError(
+                    format!("fail attempt {}", *att).into(),
+                )))
             } else {
                 Ok(()) // succeed on 5th attempt
             }
@@ -1170,7 +1229,7 @@ async fn test_time_based_retry_logic() -> eyre::Result<()> {
                 // Within 10s, rely on default logic from retry_config
                 // (which means retry_count < max_retries)
                 if let Some(max_r) = delivery.max_retries {
-                    delivery.retry_count < max_r
+                    delivery.retry_count() < max_r
                 } else {
                     false
                 }
@@ -1181,7 +1240,7 @@ async fn test_time_based_retry_logic() -> eyre::Result<()> {
         }
     }
 
-    let attempts = Arc::new(tokio::sync::Mutex::new(0));
+    let attempts = Arc::new(Mutex::new(0));
     let consumer = TimeBasedRetryConsumer {
         start: std::time::Instant::now(),
         attempts: attempts.clone(),
@@ -1281,35 +1340,35 @@ async fn test_multiple_consumers_dlq_integration() -> eyre::Result<()> {
 
     // Define Consumers A, B, and C with different policies
     struct NumericLimitConsumer {
-        attempts: Arc<tokio::sync::Mutex<u32>>,
+        attempts: Arc<Mutex<u32>>,
     }
-    #[async_trait::async_trait]
+    #[async_trait]
     impl Consumer for NumericLimitConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, _delivery: &mut Delivery<Self::Message>) -> eyre::Result<()> {
+        async fn process(&self, _delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
             let mut att = self.attempts.lock().await;
             *att += 1;
-            Err(eyre::eyre!("Always fail A"))
+            Err(ConsumerError::new(TestError("Always fail A".into())))
         }
 
         async fn should_retry(&self, delivery: &Delivery<Self::Message>) -> bool {
             // Retry up to 2 times
-            delivery.retry_count < 2
+            delivery.retry_count() < 2
         }
     }
 
     struct NoRetryConsumer {
-        attempts: Arc<tokio::sync::Mutex<u32>>,
+        attempts: Arc<Mutex<u32>>,
     }
-    #[async_trait::async_trait]
+    #[async_trait]
     impl Consumer for NoRetryConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, _delivery: &mut Delivery<Self::Message>) -> eyre::Result<()> {
+        async fn process(&self, _delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
             let mut att = self.attempts.lock().await;
             *att += 1;
-            Err(eyre::eyre!("Always fail B"))
+            Err(ConsumerError::new(TestError("Always fail B".into())))
         }
 
         async fn should_retry(&self, _delivery: &Delivery<Self::Message>) -> bool {
@@ -1318,13 +1377,13 @@ async fn test_multiple_consumers_dlq_integration() -> eyre::Result<()> {
     }
 
     struct InfiniteRetryConsumer {
-        attempts: Arc<tokio::sync::Mutex<u32>>,
+        attempts: Arc<Mutex<u32>>,
     }
-    #[async_trait::async_trait]
+    #[async_trait]
     impl Consumer for InfiniteRetryConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, delivery: &mut Delivery<Self::Message>) -> eyre::Result<()> {
+        async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
             let mut att = self.attempts.lock().await;
             *att += 1;
             // Succeed after 5 attempts
@@ -1332,7 +1391,9 @@ async fn test_multiple_consumers_dlq_integration() -> eyre::Result<()> {
                 delivery.ack().await?;
                 Ok(())
             } else {
-                Err(eyre::eyre!("Fail C attempt {}", *att))
+                Err(ConsumerError::new(TestError(
+                    format!("Fail C attempt {}", *att).into(),
+                )))
             }
         }
 
@@ -1342,9 +1403,9 @@ async fn test_multiple_consumers_dlq_integration() -> eyre::Result<()> {
     }
 
     // Initialize attempt counters
-    let a_attempts = Arc::new(tokio::sync::Mutex::new(0));
-    let b_attempts = Arc::new(tokio::sync::Mutex::new(0));
-    let c_attempts = Arc::new(tokio::sync::Mutex::new(0));
+    let a_attempts = Arc::new(Mutex::new(0));
+    let b_attempts = Arc::new(Mutex::new(0));
+    let c_attempts = Arc::new(Mutex::new(0));
 
     // Instantiate Consumers
     let cons_a = NumericLimitConsumer {
@@ -1462,22 +1523,22 @@ async fn test_large_scale_throughput_stress() -> eyre::Result<()> {
     .await?;
 
     struct MostlyOkConsumer {
-        received: Arc<tokio::sync::Mutex<u32>>,
-        acked: Arc<tokio::sync::Mutex<u32>>, // New counter for acks
+        received: Arc<Mutex<u32>>,
+        acked: Arc<Mutex<u32>>, // New counter for acks
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl Consumer for MostlyOkConsumer {
         type Message = TestMessage;
 
-        async fn process(&self, delivery: &mut Delivery<Self::Message>) -> eyre::Result<()> {
+        async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
             let mut rec = self.received.lock().await;
             *rec += 1;
 
             // Adjusted failure rate to ~1%
             if rand::random::<u8>() < 3 {
                 // Approximately 1% failure
-                Err(eyre::eyre!("Random failure"))
+                Err(ConsumerError::new(TestError("Random failure".into())))
             } else {
                 delivery.ack().await?;
                 let mut ack = self.acked.lock().await;
@@ -1488,8 +1549,8 @@ async fn test_large_scale_throughput_stress() -> eyre::Result<()> {
     }
 
     // Initialize both counters
-    let received_messages = Arc::new(tokio::sync::Mutex::new(0));
-    let acked_messages = Arc::new(tokio::sync::Mutex::new(0));
+    let received_messages = Arc::new(Mutex::new(0));
+    let acked_messages = Arc::new(Mutex::new(0));
     let consumer = MostlyOkConsumer {
         received: received_messages.clone(),
         acked: acked_messages.clone(),
