@@ -37,7 +37,7 @@ impl From<serde_json::Error> for RmqError {
 }
 
 #[derive(Debug, Clone)]
-pub struct ConsumerError(Arc<dyn StdError + Send + Sync>);
+pub struct ConsumerError(Arc<Box<dyn StdError + Send + Sync>>);
 
 impl fmt::Display for ConsumerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -56,12 +56,26 @@ impl ConsumerError {
     where
         E: StdError + Send + Sync + 'static,
     {
-        ConsumerError(Arc::new(error))
+        ConsumerError(Arc::new(error.into()))
     }
 }
 
 impl From<RmqError> for ConsumerError {
     fn from(error: RmqError) -> Self {
-        ConsumerError(Arc::new(error))
+        ConsumerError(Arc::new(error.into()))
+    }
+}
+
+#[cfg(feature = "eyre")]
+impl From<eyre::Error> for ConsumerError {
+    fn from(value: eyre::Error) -> ConsumerError {
+        ConsumerError(Arc::new(value.into()))
+    }
+}
+
+#[cfg(feature = "anyhow")]
+impl From<anyhow::Error> for ConsumerError {
+    fn from(value: anyhow::Error) -> Self {
+        ConsumerError(Arc::new(value.into()))
     }
 }

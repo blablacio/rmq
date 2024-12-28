@@ -4,8 +4,10 @@ version = "0.0.2"
 edition = "2021"
 
 [dependencies]
+anyhow = { version = "1.0.95", optional = true }
 async-trait = "0.1.83"
 dashmap = "6.1.0"
+eyre = { version = "0.6.12", optional = true }
 fred = { version = "10.0.2", features = [
     "default-nil-types",
     "enable-rustls-ring",
@@ -31,3 +33,8 @@ uuid = { version = "1.11.0", features = [
 [dev-dependencies]
 eyre = "0.6.12"
 rand = "0.8.5"
+
+[features]
+default = []
+anyhow = ["dep:anyhow"]
+eyre = ["dep:eyre"]
