@@ -76,7 +76,7 @@ struct MyConsumer;
 impl Consumer for MyConsumer {
     type Message = MyMessage;
 
-    async fn process(&self, delivery: &mut Delivery<Self::Message>) -> Result<()> {
+    async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<()> {
         println!("Processing message: {}", delivery.message.content);
         // Acknowledge on success
         delivery.ack().await?;
@@ -88,14 +88,12 @@ impl Consumer for MyConsumer {
 async fn main() -> Result<()> {
     // Create & connect a Fred client
     let config = Config::from_url("redis://127.0.0.1:6379")?;
-    let raw_client = Client::new(config, None, None, None);
-    raw_client.connect();
-    raw_client.wait_for_connect().await?;
-    let client = Arc::new(raw_client);
+    let client = Client::new(config, None, None, None);
+    client.init().await;
 
     // Build a queue from the client
     let options = QueueOptions::default();
-    let queue = Queue::new(client.clone(), "my_stream".to_string(), Some("my_group".to_string()), options).await?;
+    let queue = Queue::new(Arc::new(client), "my_stream".to_string(), Some("my_group".to_string()), options).await?;
 
     // Register consumer
     queue.register_consumer(MyConsumer).await?;
@@ -157,7 +155,7 @@ struct MyConsumer;
 #[async_trait]
 impl Consumer for MyConsumer {
     type Message = String;
-    async fn process(&self, delivery: &mut Delivery<Self::Message>) -> Result<()> {
+    async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<()> {
         println!("Processing: {}", delivery.message);
         delivery.ack().await?;
         Ok(())

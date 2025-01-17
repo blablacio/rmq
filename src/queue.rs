@@ -232,6 +232,8 @@ where
     ) {
         let consumer_id = Uuid::now_v7().to_string();
         let mut interval = tokio::time::interval(Duration::from_millis(options.poll_interval()));
+        // Auto-recovery flag (local to the consumer task)
+        let mut auto_recovery_done = false;
 
         loop {
             tokio::select! {
@@ -241,8 +243,12 @@ where
                 }
                 _ = interval.tick() => {
                     // Prepare the arguments for the Lua script
-                    let pending_timeout = options.pending_timeout.map_or("nil".to_string(), |t| t.to_string());
-
+                    let pending_timeout = if !auto_recovery_done && options.pending_timeout.is_none() {
+                        auto_recovery_done = true;  // Set the flag after the first call
+                        "5000".to_string()          // Use 5000ms for the initial xautoclaim
+                    } else {
+                        options.pending_timeout.map_or("nil".to_string(), |t| t.to_string())
+                    };
                     // Execute the Lua script using evalsha
                     let result: Result<Vec<(String, HashMap<String, Value>, u32)>, Error> = client
                         .evalsha(

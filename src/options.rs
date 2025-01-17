@@ -1,7 +1,6 @@
 pub struct QueueDefaults;
 
 impl QueueDefaults {
-    pub const PENDING_TIMEOUT: u64 = 60000; // Default pending timeout in milliseconds
     pub const POLL_INTERVAL: u64 = 100; // Default poll interval in milliseconds
     pub const DLQ_NAME: &str = "dead_letter_queue"; // Default DLQ stream name
 }
@@ -19,6 +18,7 @@ pub struct QueueOptions {
     pub poll_interval: Option<u64>,   // Interval for queue polling
     pub enable_dlq: bool,             // Toggle for using Dead-Letter Queue
     pub dlq_name: Option<String>,     // Optional DLQ stream name
+    pub auto_recovery: bool,          // Automatically recover messages on startup
 }
 
 impl Default for QueueOptions {
@@ -29,16 +29,12 @@ impl Default for QueueOptions {
             poll_interval: Some(QueueDefaults::POLL_INTERVAL),
             enable_dlq: false,
             dlq_name: Some(QueueDefaults::DLQ_NAME.to_string()),
+            auto_recovery: false,
         }
     }
 }
 
 impl QueueOptions {
-    pub fn pending_timeout(&self) -> u64 {
-        self.pending_timeout
-            .unwrap_or(QueueDefaults::PENDING_TIMEOUT)
-    }
-
     pub fn poll_interval(&self) -> u64 {
         self.poll_interval.unwrap_or(QueueDefaults::POLL_INTERVAL)
     }

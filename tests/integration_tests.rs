@@ -103,6 +103,7 @@ async fn test_stealing_queue_basic_flow() -> eyre::Result<()> {
         poll_interval: Some(100),
         enable_dlq: false,
         dlq_name: None,
+        ..Default::default()
     };
     let queue = Queue::<TestMessage>::new(
         client.clone(),
@@ -188,6 +189,7 @@ async fn test_stealing_queue_retry_behavior() -> eyre::Result<()> {
         poll_interval: Some(100),
         enable_dlq: false,
         dlq_name: None,
+        ..Default::default()
     };
 
     let queue = QueueBuilder::<TestMessage>::new()
@@ -411,6 +413,7 @@ async fn test_retry_override_without_retry_config() -> eyre::Result<()> {
         poll_interval: Some(100),
         enable_dlq: false,
         dlq_name: None,
+        ..Default::default()
     };
     let queue = Queue::<TestMessage>::new(
         client.clone(),
@@ -498,6 +501,7 @@ async fn test_default_retry_behavior_with_config() -> eyre::Result<()> {
         poll_interval: Some(100),
         enable_dlq: false,
         dlq_name: None,
+        ..Default::default()
     };
     let queue = Queue::<TestMessage>::new(
         client.clone(),
@@ -586,6 +590,7 @@ async fn test_retry_override_ignores_retry_config() -> eyre::Result<()> {
         poll_interval: Some(100),
         enable_dlq: false,
         dlq_name: None,
+        ..Default::default()
     };
     let queue = Queue::<TestMessage>::new(
         client.clone(),
@@ -675,6 +680,7 @@ async fn test_manual_queue_retries_until_success() -> Result<(), Box<dyn Error>>
         poll_interval: Some(100),
         enable_dlq: false,
         dlq_name: None,
+        ..Default::default()
     };
 
     let queue = Queue::<TestMessage>::new(
@@ -790,6 +796,7 @@ async fn test_manual_queue_exhaust_retries() -> eyre::Result<()> {
         poll_interval: Some(100),
         enable_dlq: false,
         dlq_name: None,
+        ..Default::default()
     };
 
     let queue = Queue::<TestMessage>::new(
@@ -868,6 +875,7 @@ async fn test_idempotent_processing() -> eyre::Result<()> {
         poll_interval: Some(100),
         enable_dlq: false,
         dlq_name: None,
+        ..Default::default()
     };
 
     let queue = Queue::<TestMessage>::new(
@@ -959,6 +967,7 @@ async fn test_infinite_retry_loop_in_stealing_queue() -> eyre::Result<()> {
         poll_interval: Some(100),
         enable_dlq: false,
         dlq_name: None,
+        ..Default::default()
     };
 
     let queue = Queue::<TestMessage>::new(
@@ -1040,6 +1049,7 @@ async fn test_long_delay_high_retry_manual_queue() -> eyre::Result<()> {
         poll_interval: Some(100),
         enable_dlq: false,
         dlq_name: None,
+        ..Default::default()
     };
 
     let queue = Queue::<TestMessage>::new(
@@ -1122,6 +1132,7 @@ async fn test_consumer_panic_handling() -> eyre::Result<()> {
         poll_interval: Some(100),
         enable_dlq: false,
         dlq_name: None,
+        ..Default::default()
     };
 
     let queue = Queue::<TestMessage>::new(
@@ -1189,6 +1200,7 @@ async fn test_time_based_retry_logic() -> eyre::Result<()> {
         poll_interval: Some(100),
         enable_dlq: false,
         dlq_name: None,
+        ..Default::default()
     };
 
     let queue = Queue::<TestMessage>::new(
@@ -1291,6 +1303,7 @@ async fn test_multiple_consumers_dlq_integration() -> eyre::Result<()> {
         poll_interval: Some(100),
         enable_dlq: true,                                 // Enable DLQ
         dlq_name: Some("multi_policies_dlq".to_string()), // Custom DLQ stream
+        ..Default::default()
     };
 
     let queue_a = Queue::<TestMessage>::new(
@@ -1311,6 +1324,7 @@ async fn test_multiple_consumers_dlq_integration() -> eyre::Result<()> {
         poll_interval: Some(100),
         enable_dlq: true,                                 // Enable DLQ
         dlq_name: Some("multi_policies_dlq".to_string()), // Same DLQ stream
+        ..Default::default()
     };
 
     let queue_b = Queue::<TestMessage>::new(
@@ -1328,6 +1342,7 @@ async fn test_multiple_consumers_dlq_integration() -> eyre::Result<()> {
         poll_interval: Some(100),
         enable_dlq: false, // No further DLQ for DLQ
         dlq_name: None,
+        ..Default::default()
     };
 
     let dlq_queue = Queue::<TestMessage>::new(
@@ -1512,6 +1527,7 @@ async fn test_large_scale_throughput_stress() -> eyre::Result<()> {
         poll_interval: Some(50),
         enable_dlq: false,
         dlq_name: None,
+        ..Default::default()
     };
 
     let queue = Queue::<TestMessage>::new(
