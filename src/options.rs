@@ -19,6 +19,7 @@ pub struct QueueOptions {
     pub enable_dlq: bool,             // Toggle for using Dead-Letter Queue
     pub dlq_name: Option<String>,     // Optional DLQ stream name
     pub auto_recovery: bool,          // Automatically recover messages on startup
+    pub delete_on_ack: bool,          // Automatically delete messages from queue after ack
 }
 
 impl Default for QueueOptions {
@@ -30,6 +31,7 @@ impl Default for QueueOptions {
             enable_dlq: false,
             dlq_name: Some(QueueDefaults::DLQ_NAME.to_string()),
             auto_recovery: false,
+            delete_on_ack: false,
         }
     }
 }

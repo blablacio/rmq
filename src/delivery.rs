@@ -29,6 +29,7 @@ pub struct Delivery<M> {
     pub message_id: String,
     pub message: M,
     pub max_retries: Option<u32>,
+    delete_on_ack: bool,
     state: Arc<DeliveryState>,
 }
 
@@ -45,6 +46,7 @@ where
         message: M,
         max_retries: Option<u32>,
         retry_count: u32,
+        delete_on_ack: bool,
     ) -> Self {
         Self {
             client,
@@ -54,6 +56,7 @@ where
             message_id,
             message,
             max_retries,
+            delete_on_ack,
             state: Arc::new(DeliveryState {
                 retry_count: AtomicU32::new(retry_count),
                 error: Mutex::new(None),
@@ -183,6 +186,13 @@ where
         self.client
             .xack::<i64, _, _, _>(&self.stream, &self.group, &self.message_id)
             .await?;
+
+        if self.delete_on_ack {
+            self.client
+                .xdel::<(), _, _>(&self.stream, &self.message_id)
+                .await?;
+        }
+
         Ok(())
     }
 

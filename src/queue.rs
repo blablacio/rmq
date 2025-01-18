@@ -316,6 +316,7 @@ where
                         message,
                         options.max_retries(),
                         retry_count,
+                        options.delete_on_ack,
                     );
 
                     // If this is a manual queue (no pending_timeout), start keep-alive
