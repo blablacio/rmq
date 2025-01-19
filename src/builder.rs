@@ -81,8 +81,7 @@ where
     }
 
     /// Convenience: set DLQ config in one call.
-    pub fn enable_dlq(mut self, dlq_name: &str) -> Self {
-        self.options.enable_dlq = true;
+    pub fn with_dlq(mut self, dlq_name: &str) -> Self {
         self.options.dlq_name = Some(dlq_name.to_string());
 
         self

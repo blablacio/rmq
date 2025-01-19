@@ -243,9 +243,10 @@ where
                 }
                 _ = interval.tick() => {
                     // Prepare the arguments for the Lua script
-                    let pending_timeout = if !auto_recovery_done && options.pending_timeout.is_none() {
-                        auto_recovery_done = true;  // Set the flag after the first call
-                        "5000".to_string()          // Use 5000ms for the initial xautoclaim
+                    let pending_timeout = if !auto_recovery_done && options.auto_recovery.is_some() {
+                        auto_recovery_done = true;
+
+                        options.auto_recovery.unwrap_or(5000).to_string()
                     } else {
                         options.pending_timeout.map_or("nil".to_string(), |t| t.to_string())
                     };
@@ -370,13 +371,11 @@ where
                                     }
                                 } else {
                                     // should_retry = false
-                                    if options.enable_dlq {
+                                    if let Some(dlq_name) = options.dlq_name.clone() {
                                         // Move the message to the Dead-Letter Queue
-                                        let dlq_stream = options.dlq_name();
-
                                         if let Err(e) = client
                                             .xadd::<String, _, _, _, _>(
-                                                &dlq_stream,
+                                                &dlq_name,
                                                 false,
                                                 None,
                                                 "*", // Let Redis generate a new ID
@@ -409,6 +408,7 @@ where
                                             );
                                         }
                                     }
+
                                     break;
                                 }
                             }

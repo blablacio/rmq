@@ -99,10 +99,7 @@ async fn test_stealing_queue_basic_flow() -> eyre::Result<()> {
     // Stealing queue
     let options = QueueOptions {
         pending_timeout: Some(2000),
-        retry_config: None,
         poll_interval: Some(100),
-        enable_dlq: false,
-        dlq_name: None,
         ..Default::default()
     };
     let queue = Queue::<TestMessage>::new(
@@ -187,8 +184,6 @@ async fn test_stealing_queue_retry_behavior() -> eyre::Result<()> {
             retry_delay: 0,
         }),
         poll_interval: Some(100),
-        enable_dlq: false,
-        dlq_name: None,
         ..Default::default()
     };
 
@@ -409,10 +404,7 @@ async fn test_retry_override_without_retry_config() -> eyre::Result<()> {
     // Stealing queue: pending_timeout set, no retry_config
     let options = QueueOptions {
         pending_timeout: Some(1000), // allow reclaim after 1 second
-        retry_config: None,
         poll_interval: Some(100),
-        enable_dlq: false,
-        dlq_name: None,
         ..Default::default()
     };
     let queue = Queue::<TestMessage>::new(
@@ -499,8 +491,6 @@ async fn test_default_retry_behavior_with_config() -> eyre::Result<()> {
             retry_delay: 0,
         }),
         poll_interval: Some(100),
-        enable_dlq: false,
-        dlq_name: None,
         ..Default::default()
     };
     let queue = Queue::<TestMessage>::new(
@@ -588,8 +578,6 @@ async fn test_retry_override_ignores_retry_config() -> eyre::Result<()> {
             retry_delay: 0,
         }),
         poll_interval: Some(100),
-        enable_dlq: false,
-        dlq_name: None,
         ..Default::default()
     };
     let queue = Queue::<TestMessage>::new(
@@ -678,8 +666,6 @@ async fn test_manual_queue_retries_until_success() -> Result<(), Box<dyn Error>>
             retry_delay: 0, // no delay for simplicity
         }),
         poll_interval: Some(100),
-        enable_dlq: false,
-        dlq_name: None,
         ..Default::default()
     };
 
@@ -788,14 +774,11 @@ async fn test_manual_queue_exhaust_retries() -> eyre::Result<()> {
     let client = Arc::new(client);
 
     let options = QueueOptions {
-        pending_timeout: None,
         retry_config: Some(RetryConfig {
             max_retries: 2,
             retry_delay: 0, // no delay
         }),
         poll_interval: Some(100),
-        enable_dlq: false,
-        dlq_name: None,
         ..Default::default()
     };
 
@@ -867,14 +850,11 @@ async fn test_idempotent_processing() -> eyre::Result<()> {
     let client = Arc::new(client);
 
     let options = QueueOptions {
-        pending_timeout: None,
         retry_config: Some(RetryConfig {
             max_retries: 3,
             retry_delay: 0,
         }),
         poll_interval: Some(100),
-        enable_dlq: false,
-        dlq_name: None,
         ..Default::default()
     };
 
@@ -963,10 +943,7 @@ async fn test_infinite_retry_loop_in_stealing_queue() -> eyre::Result<()> {
 
     let options = QueueOptions {
         pending_timeout: Some(1000), // 1 second
-        retry_config: None,          // No numeric limit, should_retry decides forever
         poll_interval: Some(100),
-        enable_dlq: false,
-        dlq_name: None,
         ..Default::default()
     };
 
@@ -1041,14 +1018,11 @@ async fn test_long_delay_high_retry_manual_queue() -> eyre::Result<()> {
     let client = Arc::new(client);
 
     let options = QueueOptions {
-        pending_timeout: None, // manual queue
         retry_config: Some(RetryConfig {
             max_retries: 50,
             retry_delay: 1000, // 1 second delay between attempts
         }),
         poll_interval: Some(100),
-        enable_dlq: false,
-        dlq_name: None,
         ..Default::default()
     };
 
@@ -1128,10 +1102,7 @@ async fn test_consumer_panic_handling() -> eyre::Result<()> {
     // Stealing queue scenario
     let options = QueueOptions {
         pending_timeout: Some(1000),
-        retry_config: None,
         poll_interval: Some(100),
-        enable_dlq: false,
-        dlq_name: None,
         ..Default::default()
     };
 
@@ -1192,14 +1163,11 @@ async fn test_time_based_retry_logic() -> eyre::Result<()> {
     let client = Arc::new(client);
 
     let options = QueueOptions {
-        pending_timeout: None, // manual queue
         retry_config: Some(RetryConfig {
             max_retries: 10,
             retry_delay: 500, // 0.5s delay
         }),
         poll_interval: Some(100),
-        enable_dlq: false,
-        dlq_name: None,
         ..Default::default()
     };
 
@@ -1301,7 +1269,6 @@ async fn test_multiple_consumers_dlq_integration() -> eyre::Result<()> {
             retry_delay: 50,
         }),
         poll_interval: Some(100),
-        enable_dlq: true,                                 // Enable DLQ
         dlq_name: Some("multi_policies_dlq".to_string()), // Custom DLQ stream
         ..Default::default()
     };
@@ -1322,7 +1289,6 @@ async fn test_multiple_consumers_dlq_integration() -> eyre::Result<()> {
             retry_delay: 50,
         }),
         poll_interval: Some(100),
-        enable_dlq: true,                                 // Enable DLQ
         dlq_name: Some("multi_policies_dlq".to_string()), // Same DLQ stream
         ..Default::default()
     };
@@ -1338,10 +1304,7 @@ async fn test_multiple_consumers_dlq_integration() -> eyre::Result<()> {
     // Initialize the DLQ Queue for Consumer C
     let dlq_options = QueueOptions {
         pending_timeout: Some(1000),
-        retry_config: None,
         poll_interval: Some(100),
-        enable_dlq: false, // No further DLQ for DLQ
-        dlq_name: None,
         ..Default::default()
     };
 
@@ -1525,8 +1488,6 @@ async fn test_large_scale_throughput_stress() -> eyre::Result<()> {
             retry_delay: 50,
         }),
         poll_interval: Some(50),
-        enable_dlq: false,
-        dlq_name: None,
         ..Default::default()
     };
 

@@ -2,7 +2,6 @@ pub struct QueueDefaults;
 
 impl QueueDefaults {
     pub const POLL_INTERVAL: u64 = 100; // Default poll interval in milliseconds
-    pub const DLQ_NAME: &str = "dead_letter_queue"; // Default DLQ stream name
 }
 
 #[derive(Clone)]
@@ -16,9 +15,8 @@ pub struct QueueOptions {
     pub pending_timeout: Option<u64>, // Timeout after which a message is reclaimed
     pub retry_config: Option<RetryConfig>, // Retry configuration
     pub poll_interval: Option<u64>,   // Interval for queue polling
-    pub enable_dlq: bool,             // Toggle for using Dead-Letter Queue
     pub dlq_name: Option<String>,     // Optional DLQ stream name
-    pub auto_recovery: bool,          // Automatically recover messages on startup
+    pub auto_recovery: Option<u64>,   // Automatically recover messages on startup after timeout
     pub delete_on_ack: bool,          // Automatically delete messages from queue after ack
 }
 
@@ -28,9 +26,8 @@ impl Default for QueueOptions {
             pending_timeout: None,
             retry_config: None,
             poll_interval: Some(QueueDefaults::POLL_INTERVAL),
-            enable_dlq: false,
-            dlq_name: Some(QueueDefaults::DLQ_NAME.to_string()),
-            auto_recovery: false,
+            dlq_name: None,
+            auto_recovery: None,
             delete_on_ack: false,
         }
     }
@@ -43,12 +40,6 @@ impl QueueOptions {
 
     pub(crate) fn max_retries(&self) -> Option<u32> {
         self.retry_config.as_ref().map(|c| c.max_retries)
-    }
-
-    pub(crate) fn dlq_name(&self) -> String {
-        self.dlq_name
-            .clone()
-            .unwrap_or(QueueDefaults::DLQ_NAME.to_string())
     }
 
     pub fn retry_delay(&self) -> u64 {
