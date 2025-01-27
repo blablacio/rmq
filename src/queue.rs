@@ -278,6 +278,7 @@ where
                                         fields,
                                         retry_count,
                                         &options,
+                                        shutdown_rx.clone(),
                                     )
                                     .await;
                                 }
@@ -304,7 +305,14 @@ where
         fields: HashMap<String, Value>,
         retry_count: u32,
         options: &QueueOptions,
+        shutdown_rx: Receiver<bool>,
     ) {
+        if *shutdown_rx.borrow() {
+            debug!("Shutdown signal received before processing message {}, returning immediately without acking.", message_id);
+
+            return; // Exit immediately, DO NOT ACK here
+        }
+
         if let Some(data) = fields.get("data") {
             match serde_json::from_value::<M>(data.clone()) {
                 Ok(message) => {
@@ -343,6 +351,13 @@ where
                                     message_id,
                                     e.to_string()
                                 );
+
+                                // Check for shutdown signal before retry
+                                if *shutdown_rx.borrow() {
+                                    debug!("Shutdown signal received before retry check for message {}, skipping retry.", message_id);
+
+                                    return; // Exit immediately, DO NOT RETRY or set_error
+                                }
 
                                 delivery.set_error(e.clone()).await;
 

@@ -4,25 +4,25 @@
 
 ## Features
 
-- **Consumer Groups**  
+- **Consumer Groups**
   Utilize Redis Streams consumer groups to coordinate multiple consumers working on the same stream.
 
-- **Retries & Backoff**  
+- **Retries & Backoff**
   Configure retry policies, delays, and custom logic for when and how messages should be retried.
 
-- **Dead-Letter Queues (DLQ)**  
+- **Dead-Letter Queues (DLQ)**
   Optionally route failed messages that exceed the maximum retry count to a dead-letter queue for manual inspection.
 
-- **Keep-Alive & Manual Queues**  
+- **Keep-Alive & Manual Queues**
   Keep messages claimed if processing takes longer than expected, or use manual queues for more control over message acknowledgment.
 
-- **Multiple Initialization Modes**  
+- **Multiple Initialization Modes**
   Use a single `fred::Client`, pass a Redis URL directly, or use our fluent `QueueBuilder` to configure the queue step by step.
 
-- **Clonable Queues & Deliveries**  
+- **Clonable Queues & Deliveries**
   Both `Queue` and `Delivery` structs can be freely cloned and passed around, enabling flexible concurrency patterns and easier integration with async workflows.
 
-- **Integration-Ready**  
+- **Integration-Ready**
   Easily run integration tests against a local or containerized Redis instance for reliable testing in CI/CD pipelines.
 
 ---
@@ -31,10 +31,10 @@
 
 ### Prerequisites
 
-- **Rust Toolchain**  
+- **Rust Toolchain**
   Install Rust (via [rustup](https://rustup.rs/)) to build the library.
 
-- **Redis**  
+- **Redis**
   A running Redis instance is required. For local development, you can quickly spin one up with Docker:
   ```bash
   docker run --rm -p 6379:6379 redis:latest
@@ -202,7 +202,11 @@ async fn main() -> eyre::Result<()> {
                 retry_delay: 500,
             }),
             enable_dlq: true,
-            dlq_name: Some("my_dlq_stream".to_string()),
+            auto_recovery: Some(30000), // Auto-recover messages pending for 30 seconds on startup
+            delete_on_ack: true,        // Delete messages after successful acknowledgment
+            poll_interval: Some(50),      // Custom poll interval
+            pending_timeout: Some(5000),  // Custom pending timeout
+            dlq_name: Some("my_dlq_stream".to_string()), // Or use a Dead-Letter Queue
             ..Default::default()
         })
         .build()
@@ -233,16 +237,28 @@ let options = QueueOptions {
         retry_delay: 1000, // 1-second delay before each retry
     }),
     enable_dlq: true,
-    dlq_name: Some("my_dlq_stream".to_string()),
+    auto_recovery: Some(30000), // Auto-recover messages pending for 30 seconds on startup
+    delete_on_ack: true,        // Delete messages after successful acknowledgment
+    poll_interval: Some(50),      // Custom poll interval
+    pending_timeout: Some(5000),  // Custom pending timeout
+    dlq_name: Some("my_dlq_stream".to_string()), // Or use a Dead-Letter Queue
     ..Default::default()
 };
 ```
 
 When a consumer fails, the queue decides (based on `should_retry()`) if the message is retried or moved to the DLQ.
 
+### Auto-Recovery
+
+The `auto_recovery` option, when set to `Some(timeout_ms)`, enables automatic recovery of pending messages when a consumer starts up. If messages in the pending queue have been pending for longer than `timeout_ms`, the consumer will attempt to claim and re-process them on startup. This is useful in scenarios where consumers might crash or become unavailable, ensuring messages are not stuck indefinitely in the pending state.
+
+### Delete on Ack
+
+Setting `delete_on_ack: true` in `QueueOptions` will automatically delete messages from the Redis stream after they are successfully acknowledged by a consumer. By default, messages remain in the stream even after acknowledgment, which can be useful for audit trails or data retention, but enabling this option provides true "queue" semantics where messages are removed after processing.
+
 ### Manual vs. Stealing Queues
 
-If `pending_timeout` is `None`, the queue is a **manual queue** (messages won’t be reclaimed automatically). The consumer must **ack** or **retry** in-process.  
+If `pending_timeout` is `None`, the queue is a **manual queue** (messages won’t be reclaimed automatically). The consumer must **ack** or **retry** in-process.
 If `pending_timeout` is `Some(...)`, it’s a **stealing queue**—Redis Streams will auto-claim messages that a consumer has taken too long to acknowledge.
 
 ---
@@ -271,24 +287,24 @@ _(As long as you have a local Redis instance accessible via `REDIS_URL` or the d
 
 ## Configuration Summary
 
-- **REDIS_URL**  
+- **REDIS_URL**
   An environment variable used by your code/tests to point to the Redis instance (if you want).
-- **`QueueOptions`**  
+- **`QueueOptions`**
   Set up pending timeout, poll interval, and optional `RetryConfig`.
-- **`Consumer`**  
+- **`Consumer`**
   Implement custom logic in `process()` and optionally override `should_retry()` to control message handling.
 
 ---
 
 ## Contributing
 
-Contributions are welcome! Please open an issue or submit a pull request at [GitHub](https://github.com/blablacio/rmq). We’d love to see your ideas on advanced features, improved scheduling, or broader use cases.
+Contributions are welcome! Please open an issue or submit a pull request at [GitHub](https://github.com/blablacio/rmq.git). We’d love to see your ideas on advanced features, improved scheduling, or broader use cases.
 
 ---
 
 ## License
 
-This project is licensed under [The Unlicense](https://unlicense.org).  
+This project is licensed under [The Unlicense](https://unlicense.org).
 You can find the license text in the [LICENSE](LICENSE) file.
 
 ---

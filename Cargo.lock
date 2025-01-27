@@ -246,9 +246,9 @@ dependencies = [
 
 [[package]]
 name = "fred"
-version = "10.0.3"
+version = "10.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "391bb3c769c0caea1c536b1e0802572740b8d686a9d363991277c6bc25b24eba"
+checksum = "b03185135e70ab7e7008a77f588874571599133d7191fea438b0c731f643794d"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "rmq"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1011,9 +1011,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.136"
+version = "1.0.137"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "336a0c23cf42a38d9eaa7cd22c7040d04e1228a19a933890805ffd00a16437d2"
+checksum = "930cfb6e6abf99298aaad7d29abbef7a9999a9a8806a40088f55f0dcec03146b"
 dependencies = [
  "itoa",
  "memchr",
@@ -1347,9 +1347,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uuid"
-version = "1.12.0"
+version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "744018581f9a3454a9e15beb8a33b017183f1e7c0cd170232a2d1453b23a51c4"
+checksum = "b3758f5e68192bb96cc8f9b7e2c2cfdabb435499a28499a42f8f984092adad4b"
 dependencies = [
  "getrandom",
  "rand",

@@ -1575,3 +1575,339 @@ async fn test_large_scale_throughput_stress() -> eyre::Result<()> {
     client.del::<String, _>("large_scale_stream").await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn test_auto_recovery_option() -> eyre::Result<()> {
+    let config = Config::from_url(&get_redis_url())?;
+    let client = Client::new(config, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+
+    /// A consumer that conditionally acknowledges messages, for auto-recovery test.
+    struct AutoRecoveryTestConsumer {
+        received_messages: Arc<Mutex<Vec<TestMessage>>>,
+        is_initial_consumer: bool, // Flag to control ack behavior
+    }
+
+    #[async_trait]
+    impl Consumer for AutoRecoveryTestConsumer {
+        type Message = TestMessage;
+
+        async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
+            let mut msgs = self.received_messages.lock().await;
+            msgs.push(delivery.message.clone());
+
+            if self.is_initial_consumer {
+                // DO NOT ACK in the initial consumer, leave message pending for auto-recovery
+                Ok(())
+            } else {
+                delivery.ack().await?; // ACK in the auto-recovery consumer
+                Ok(())
+            }
+        }
+    }
+
+    let stream_name = "auto_recovery_stream";
+    let group_name = "auto_recovery_group";
+
+    // Create queue with auto_recovery = Some(1000) - 1 second
+    let options = QueueOptions {
+        pending_timeout: Some(2000),
+        auto_recovery: Some(1000),
+        poll_interval: Some(100),
+        ..Default::default()
+    };
+
+    let queue = Queue::<TestMessage>::new(
+        client.clone(),
+        stream_name.to_string(),
+        Some(group_name.to_string()),
+        options.clone(),
+    )
+    .await?;
+
+    let received_messages1 = Arc::new(Mutex::new(Vec::new()));
+    let consumer1 = AutoRecoveryTestConsumer {
+        received_messages: received_messages1.clone(),
+        is_initial_consumer: false, // <--- IMPORTANT: Initial consumer *DOES* ACK (to simulate normal processing)
+    };
+    queue.register_consumer(consumer1).await?;
+
+    // Produce a message
+    let msg = TestMessage {
+        content: "Auto-Recovery Test Msg".into(),
+    };
+    queue.produce(&msg).await?;
+
+    sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        received_messages1.lock().await.len(),
+        1,
+        "Message not initially processed"
+    );
+
+    // Shutdown queue (consumer 1), message is ALREADY ACKED by consumer1
+    queue.shutdown(None).await;
+    sleep(Duration::from_secs(2)).await;
+
+    // Create a new queue instance (queue2) with auto_recovery
+    let queue2 = Queue::<TestMessage>::new(
+        client.clone(),
+        stream_name.to_string(),
+        Some(group_name.to_string()),
+        options, // Same options including auto_recovery
+    )
+    .await?;
+
+    let received_messages2 = Arc::new(Mutex::new(Vec::new()));
+    let consumer2 = AutoRecoveryTestConsumer {
+        received_messages: received_messages2.clone(),
+        is_initial_consumer: false, // <--- IMPORTANT: Auto-recovery consumer ALSO ACKS
+    };
+    queue2.register_consumer(consumer2).await?;
+
+    sleep(Duration::from_secs(5)).await;
+
+    let total_received =
+        received_messages1.lock().await.len() + received_messages2.lock().await.len();
+    assert_eq!(
+        total_received, 1,
+        "Message should NOT be auto-recovered and processed again"
+    ); // Corrected assertion: expect 1
+
+    // Cleanup
+    client
+        .xgroup_destroy::<String, _, _>(stream_name, group_name)
+        .await?;
+    client.del::<String, _>(stream_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_on_ack_option() -> eyre::Result<()> {
+    let config = Config::from_url(&get_redis_url())?;
+    let client = Client::new(config, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+
+    let stream_name = "delete_on_ack_stream";
+    let group_name = "delete_on_ack_group";
+
+    let options = QueueOptions {
+        delete_on_ack: true, // Enable delete_on_ack
+        ..Default::default()
+    };
+
+    let queue = Queue::<TestMessage>::new(
+        client.clone(),
+        stream_name.to_string(),
+        Some(group_name.to_string()),
+        options,
+    )
+    .await?;
+
+    let received_messages = Arc::new(Mutex::new(Vec::new())); // Initialize received_messages
+    let consumer = TestAcknowledgeConsumer {
+        // Create TestAcknowledgeConsumer
+        received_messages: received_messages.clone(),
+    };
+    queue.register_consumer(consumer).await?; // Register the consumer
+
+    let msg = TestMessage {
+        content: "Delete on Ack Test".into(),
+    };
+    queue.produce(&msg).await?;
+    sleep(Duration::from_secs(3)).await; // Wait for processing and ack (increased sleep)
+
+    let stream_len = client.xlen::<u32, _>(stream_name).await?;
+    assert_eq!(
+        stream_len, 0,
+        "Stream should be empty after ack due to delete_on_ack"
+    );
+
+    // Cleanup
+    client
+        .xgroup_destroy::<String, _, _>(stream_name, group_name)
+        .await?;
+    client.del::<String, _>(stream_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_shutdown_before_process() -> eyre::Result<()> {
+    let config = Config::from_url(&get_redis_url())?;
+    let client = Client::new(config, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+
+    /// A consumer that records received messages but NEVER acknowledges them.
+    struct NoAckConsumer {
+        received_messages: Arc<Mutex<Vec<TestMessage>>>,
+    }
+
+    #[async_trait]
+    impl Consumer for NoAckConsumer {
+        type Message = TestMessage;
+
+        async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
+            let mut msgs = self.received_messages.lock().await;
+            msgs.push(delivery.message.clone());
+            // DO NOT ACK - Leave message pending
+            Err(ConsumerError::new(TestError("No ACK!".into())))
+        }
+
+        async fn should_retry(&self, _delivery: &Delivery<Self::Message>) -> bool {
+            true
+        }
+    }
+
+    let stream_name = "shutdown_before_stream";
+    let group_name = "shutdown_before_group";
+
+    let queue = Queue::<TestMessage>::new(
+        client.clone(),
+        stream_name.to_string(),
+        Some(group_name.to_string()),
+        QueueOptions::default(),
+    )
+    .await?;
+
+    let received_messages = Arc::new(Mutex::new(Vec::new()));
+    let consumer = NoAckConsumer {
+        // Use NoAckConsumer - does NOT ack
+        received_messages: received_messages.clone(),
+    };
+    queue.register_consumer(consumer).await?;
+
+    // Produce a message
+    let msg = TestMessage {
+        content: "Shutdown Before Process Msg".into(),
+    };
+    queue.produce(&msg).await?;
+
+    // Immediately shutdown the queue - before consumer likely processes
+    queue.shutdown(Some(2000)).await;
+
+    sleep(Duration::from_secs(3)).await; // Wait for shutdown and polling
+
+    let msgs = received_messages.lock().await;
+    assert_eq!(
+        msgs.len(),
+        0,
+        "Message should NOT be processed due to shutdown"
+    ); // Assert: Not processed
+
+    let (pending_count, _, _, _): (u64, String, String, Vec<(String, u64)>) =
+        client.xpending(stream_name, group_name, ()).await?;
+    assert_eq!(
+        pending_count, 1,
+        "Message should remain pending in the queue"
+    ); // Assert: Message pending
+
+    // Cleanup
+    client
+        .xgroup_destroy::<String, _, _>(stream_name, group_name)
+        .await?;
+    client.del::<String, _>(stream_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_shutdown_during_error_handling() -> eyre::Result<()> {
+    let config = Config::from_url(&get_redis_url())?;
+    let client = Client::new(config, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+
+    /// A consumer that always fails and always retries (should_retry = true).
+    struct FailingRetryConsumer {
+        attempts: Arc<Mutex<u32>>,
+        received_messages: Arc<Mutex<Vec<TestMessage>>>,
+    }
+
+    #[async_trait]
+    impl Consumer for FailingRetryConsumer {
+        type Message = TestMessage;
+
+        async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
+            let mut attempts = self.attempts.lock().await;
+            *attempts += 1;
+            let mut msgs = self.received_messages.lock().await;
+            msgs.push(delivery.message.clone());
+            Err(ConsumerError::new(TestError(
+                "Simulated Processing Failure".into(),
+            )))
+        }
+
+        async fn should_retry(&self, _delivery: &Delivery<Self::Message>) -> bool {
+            true // Always retry
+        }
+    }
+
+    let stream_name = "shutdown_error_stream";
+    let group_name = "shutdown_error_group";
+
+    let queue = Queue::<TestMessage>::new(
+        client.clone(),
+        stream_name.to_string(),
+        Some(group_name.to_string()),
+        QueueOptions {
+            pending_timeout: Some(1000), // Stealing queue for retry to be relevant
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let attempts = Arc::new(Mutex::new(0));
+    let received_messages = Arc::new(Mutex::new(Vec::new()));
+    let consumer = FailingRetryConsumer {
+        // Use FailingNoRetryConsumer - always fails, no retry
+        attempts: attempts.clone(),
+        received_messages: received_messages.clone(),
+    };
+    queue.register_consumer(consumer).await?;
+
+    // Produce a message
+    let msg = TestMessage {
+        content: "Shutdown During Error Msg".into(),
+    };
+    queue.produce(&msg).await?;
+
+    sleep(Duration::from_secs(1)).await; // Give consumer time to start processing and fail once
+
+    // Now shutdown the queue - during error handling
+    queue.shutdown(Some(2000)).await;
+
+    sleep(Duration::from_secs(3)).await; // Wait for shutdown and polling
+
+    let msgs = received_messages.lock().await;
+    assert_eq!(
+        msgs.len(),
+        1,
+        "Message should be processed once before shutdown"
+    ); // Assert: Processed once
+
+    let attempts_count = *attempts.lock().await;
+    assert_eq!(
+        attempts_count, 1,
+        "Consumer should have attempted processing only once"
+    ); // Assert: Only 1 attempt
+
+    let (pending_count, _, _, _): (u64, String, String, Vec<(String, u64)>) =
+        client.xpending(stream_name, group_name, ()).await?;
+    assert_eq!(
+        pending_count, 1,
+        "Message should remain pending in the queue"
+    ); // Assert: Message pending
+
+    // Cleanup
+    client
+        .xgroup_destroy::<String, _, _>(stream_name, group_name)
+        .await?;
+    client.del::<String, _>(stream_name).await?;
+    Ok(())
+}
