@@ -8,14 +8,23 @@ use fred::{
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use tokio::{
-    sync::watch::{self, Receiver, Sender},
+    sync::{
+        watch::{self, Receiver, Sender},
+        Mutex,
+    },
     task::JoinHandle,
-    time::{sleep, timeout},
+    time::{interval, sleep, timeout},
 };
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use crate::{consumer::Consumer, delivery::Delivery, errors::RmqResult, options::QueueOptions};
+use crate::{
+    consumer::Consumer,
+    delivery::Delivery,
+    errors::RmqResult,
+    options::{QueueOptions, RetrySyncPolicy},
+    prefetch::{ConsumerChannel, MessageBuffer},
+};
 
 #[derive(Clone)]
 pub struct Queue<M> {
@@ -26,8 +35,17 @@ pub struct Queue<M> {
     script_hash: String,
     shutdown_tx: Sender<bool>,
     shutdown_rx: Receiver<bool>,
-    tasks: Arc<DashMap<Uuid, JoinHandle<()>>>,
+    tasks: Arc<DashMap<Uuid, TaskState<M>>>, // Store both handle and delivery
+    message_buffer: Arc<MessageBuffer<M>>,
+    prefetch_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    queue_id: String, // Unique queue ID for all operations
     marker: PhantomData<M>,
+}
+
+// Add a new struct to track both task handles and deliveries
+struct TaskState<M> {
+    handle: JoinHandle<()>,
+    delivery: Option<Arc<Mutex<Option<Delivery<M>>>>>,
 }
 
 impl<M> Queue<M>
@@ -70,17 +88,148 @@ where
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let message_buffer = Arc::new(MessageBuffer::new(50)); // 50 messages per consumer
 
-        Ok(Self {
-            client,
-            stream,
-            group,
-            options,
+        // Create a single consumer ID for all operations with this queue
+        // Format: "queue-{group_name}-{unique_id}"
+        let queue_id = format!("queue-{}-{}", group, Uuid::now_v7());
+
+        let queue = Self {
+            client: client.clone(),
+            stream: stream.clone(),
+            group: group.clone(),
+            options: options.clone(),
             script_hash,
+            tasks: Arc::new(DashMap::new()),
             shutdown_tx,
             shutdown_rx,
-            tasks: Arc::new(DashMap::new()),
+            message_buffer,
+            prefetch_task: Arc::new(Mutex::new(None)),
+            queue_id,
             marker: PhantomData,
+        };
+
+        // Start the prefetch task
+        if let Some(_) = options.prefetch_count {
+            // Start prefetch task with the specified count
+            let prefetch_task = queue.start_prefetch_task().await;
+            *queue.prefetch_task.lock().await = Some(prefetch_task);
+        }
+
+        Ok(queue)
+    }
+
+    async fn start_prefetch_task(&self) -> JoinHandle<()> {
+        let client = self.client.clone();
+        let stream = self.stream.clone();
+        let group = self.group.clone();
+        let options = self.options.clone();
+        let script_hash = self.script_hash.clone();
+        let message_buffer = self.message_buffer.clone();
+        // Use the queue's consumer ID instead of generating a new one
+        let prefetcher_id = self.queue_id.clone();
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        let mut auto_recovery_done = false;
+
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_millis(options.poll_interval()));
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        debug!("Prefetcher received shutdown signal. Exiting.");
+
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        // Get current consumer count to scale prefetch appropriately
+                        let consumer_count = message_buffer.consumer_count().await;
+
+                        if consumer_count == 0 {
+                            // No consumers, no need to prefetch
+                            continue;
+                        }
+
+                        // Calculate the appropriate prefetch amount based on consumer count
+                        // This matches the original RMQ's formula: prefetchLimit + numConsumers
+                        let effective_prefetch = options.prefetch_count.unwrap_or(0) + consumer_count as u32;
+
+                        // Get current buffer state
+                        let current_len = message_buffer.get_overflow_size().await;
+
+                        // Only fetch more if there's space for a meaningful number of messages
+                        // This is more aggressive than before and keeps the buffer fuller
+                        if current_len >= effective_prefetch as usize {
+                            continue;
+                        }
+
+                        // Calculate how many messages to fetch to fill the buffer
+                        let fetch_count = effective_prefetch - current_len as u32;
+
+                        // Skip tiny fetches
+                        if fetch_count < 10 {
+                            continue;
+                        }
+
+                        let pending_timeout = if !auto_recovery_done && options.auto_recovery.is_some() {
+                            auto_recovery_done = true;
+
+                            options.auto_recovery
+                        } else {
+                            options.pending_timeout
+                        };
+
+                        let pending_timeout_arg = match pending_timeout {
+                            Some(timeout) => timeout.to_string(),
+                            None => "nil".to_string(),
+                        };
+
+                        debug!(
+                            "Prefetcher fetching {} messages for group '{}' with timeout {}",
+                            fetch_count,
+                            group,
+                            pending_timeout_arg
+                        );
+
+                        let batch_size = fetch_count.to_string();
+
+                        // Fetch from Redis
+                        let result: Result<Vec<(String, HashMap<String, Value>, u32)>, Error> = client
+                            .evalsha::<Vec<(String, HashMap<String, Value>, u32)>, _, _, _>(
+                                &script_hash,
+                                &[&stream],
+                                &[&group, &prefetcher_id, &pending_timeout_arg, &batch_size],
+                            )
+                            .await;
+
+                        match result {
+                            Ok(messages) => {
+                                debug!(
+                                    "Prefetcher fetched {} messages for group '{}'",
+                                    messages.len(),
+                                    group
+                                );
+
+                                // If we got close to our requested batch size, check if we need to immediately
+                                // fetch more to keep the buffer full (don't wait for next interval)
+                                let fetched_count = messages.len();
+                                message_buffer.push(messages).await;
+
+                                // If we got a significant number of messages and are close to our requested
+                                // batch size, immediately reset the interval to fetch more messages without waiting
+                                if fetched_count >= (fetch_count as usize * 3/4) && fetched_count > 50 {
+                                    interval.reset();
+                                }
+                            }
+                            Err(e) => {
+                                error!("Error executing Lua script: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            debug!("Prefetcher task completed.");
         })
     }
 
@@ -116,20 +265,64 @@ where
             warn!("Failed to send shutdown signal; consumers may not stop.");
         }
 
+        // Wait for the prefetcher using the same pattern as wait_tasks()
+        if let Some(handle) = self.prefetch_task.lock().await.take() {
+            debug!("Waiting for prefetcher to terminate...");
+
+            // Apply a short timeout specifically for the prefetcher
+            match shutdown_timeout {
+                Some(_) => {
+                    // Always use a short timeout for prefetcher (200ms max)
+                    let prefetcher_timeout = Duration::from_millis(200);
+
+                    match timeout(prefetcher_timeout, handle).await {
+                        Ok(_) => debug!("Prefetcher terminated within timeout."),
+                        Err(_) => {
+                            debug!("Prefetcher didn't terminate in time; aborting it.");
+                        }
+                    }
+                }
+                None => {
+                    // Wait indefinitely (match wait_tasks behavior)
+                    let _ = handle.await;
+
+                    debug!("Prefetcher terminated gracefully.");
+                }
+            }
+        }
+
+        // Handle retry sync policy for OnShutdown
+        if let RetrySyncPolicy::OnShutdown = self.options.retry_sync {
+            // Sync any active deliveries
+            for entry in self.tasks.iter() {
+                if let Some(task_state) = entry.value().delivery.as_ref() {
+                    if let Some(delivery) = task_state.lock().await.as_ref() {
+                        // Attempt to sync the delivery count, but don't block shutdown if it fails
+                        if let Err(e) = delivery.sync_delivery_count().await {
+                            warn!("Failed to sync delivery count on shutdown: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
         // Wait for all consumer tasks to terminate
         match shutdown_timeout {
             Some(timeout_millis) => {
                 let duration = Duration::from_millis(timeout_millis);
+
                 match timeout(duration, self.wait_tasks()).await {
                     Ok(_) => debug!("All consumer tasks terminated within timeout."),
                     Err(_) => {
                         debug!("Timeout reached; aborting remaining tasks.");
+
                         self.abort_tasks().await;
                     }
                 }
             }
             None => {
                 self.wait_tasks().await;
+
                 debug!("All consumer tasks terminated gracefully.");
             }
         }
@@ -145,8 +338,8 @@ where
             .map(|entry| *entry.key())
             .collect::<Vec<_>>()
         {
-            if let Some((_, handle)) = self.tasks.remove(&key) {
-                tasks.push(handle);
+            if let Some((_, task_state)) = self.tasks.remove(&key) {
+                tasks.push(task_state.handle);
             }
         }
 
@@ -163,8 +356,8 @@ where
             .map(|entry| *entry.key())
             .collect::<Vec<_>>()
         {
-            if let Some((_, handle)) = self.tasks.remove(&key) {
-                handle.abort();
+            if let Some((_, task_state)) = self.tasks.remove(&key) {
+                task_state.handle.abort();
             }
         }
     }
@@ -176,9 +369,15 @@ where
         let id = Uuid::now_v7();
 
         // Spawn the consumer task as a method on Queue
-        let handle = self.start_consumer(Arc::new(consumer)).await?;
+        let (handle, delivery_holder) = self.start_consumer(Arc::new(consumer)).await?;
 
-        self.tasks.insert(id, handle);
+        self.tasks.insert(
+            id,
+            TaskState {
+                handle,
+                delivery: delivery_holder,
+            },
+        );
 
         Ok(id)
     }
@@ -186,7 +385,7 @@ where
     async fn start_consumer(
         &self,
         consumer: Arc<dyn Consumer<Message = M>>,
-    ) -> RmqResult<JoinHandle<()>> {
+    ) -> RmqResult<(JoinHandle<()>, Option<Arc<Mutex<Option<Delivery<M>>>>>)> {
         let client = self.client.clone();
         let stream = self.stream.clone();
         let group = self.group.clone();
@@ -194,20 +393,53 @@ where
         let script_hash = self.script_hash.clone();
         let shutdown_rx = self.shutdown_rx.clone();
 
+        // Create a shared delivery holder if we need to track active deliveries
+        let delivery_holder = if self.options.retry_sync == RetrySyncPolicy::OnShutdown {
+            Some(Arc::new(Mutex::new(None)))
+        } else {
+            None
+        };
+
+        // Clone it to pass to the consumer task
+        let task_delivery_holder = delivery_holder.clone();
+
+        // Generate a unique consumer task ID
+        let consumer_id = Uuid::now_v7();
+
+        // Use the queue's ID for Redis operations
+        let queue_id = self.queue_id.clone();
+
+        // Register with prefetch system using the consumer-specific ID
+        let consumer_channel = match options.prefetch_count {
+            Some(_) => Some(self.message_buffer.register_consumer(consumer_id).await),
+            None => None,
+        };
+
+        // Add message_buffer to pass to consumer_task
+        let message_buffer = match options.prefetch_count {
+            Some(_) => Some(self.message_buffer.clone()),
+            None => None,
+        };
+
         let handle = tokio::spawn(async move {
             Self::consumer_task(
                 client,
                 stream,
                 group,
                 consumer,
+                queue_id,    // Use queue_id for Redis operations
+                consumer_id, // Pass the consumer-specific ID
                 options,
                 script_hash,
                 shutdown_rx,
+                consumer_channel,
+                task_delivery_holder,
+                message_buffer,
             )
             .await;
         });
 
-        Ok(handle)
+        Ok((handle, delivery_holder))
     }
 
     // Produce a message to the queue (Redis Stream)
@@ -226,73 +458,114 @@ where
         stream: String,
         group: String,
         consumer: Arc<dyn Consumer<Message = M>>,
+        queue_id: String,
+        consumer_id: Uuid,
         options: QueueOptions,
         script_hash: String,
         mut shutdown_rx: Receiver<bool>,
+        mut consumer_channel: Option<ConsumerChannel<M>>,
+        delivery_holder: Option<Arc<Mutex<Option<Delivery<M>>>>>,
+        message_buffer: Option<Arc<MessageBuffer<M>>>,
     ) {
-        let consumer_id = Uuid::now_v7().to_string();
-        let mut interval = tokio::time::interval(Duration::from_millis(options.poll_interval()));
-        // Auto-recovery flag (local to the consumer task)
         let mut auto_recovery_done = false;
 
         loop {
+            let shutdown_clone = shutdown_rx.clone();
+
             tokio::select! {
                 _ = shutdown_rx.changed() => {
-                    debug!("Consumer Task '{}' received shutdown signal. Exiting.", &consumer_id);
+                    debug!("Consumer Task '{}' received shutdown signal. Exiting.", &queue_id);
+
                     break;
                 }
-                _ = interval.tick() => {
-                    // Prepare the arguments for the Lua script
-                    let pending_timeout = if !auto_recovery_done && options.auto_recovery.is_some() {
-                        auto_recovery_done = true;
+                _ = async {
+                    // Get message either from prefetch channel or directly from Redis
+                    let message_result = if let Some(channel) = &mut consumer_channel {
+                        match channel.receive().await {
+                            Some(message) => Ok(vec![message]),
+                            None => {
+                                // Channel closed, likely due to queue shutdown
+                                debug!("Consumer channel closed for {}", queue_id);
 
-                        options.auto_recovery.unwrap_or(5000).to_string()
+                                return;
+                            }
+                        }
                     } else {
-                        options.pending_timeout.map_or("nil".to_string(), |t| t.to_string())
-                    };
-                    // Execute the Lua script using evalsha
-                    let result: Result<Vec<(String, HashMap<String, Value>, u32)>, Error> = client
-                        .evalsha(
-                            script_hash.clone(),
-                            vec![stream.clone()],
-                            vec![
-                                group.clone(),
-                                consumer_id.clone(),
-                                pending_timeout,
-                            ],
-                        )
-                        .await;
+                        // Traditional direct fetch for prefetch_count = 1
+                        let pending_timeout = if !auto_recovery_done && options.auto_recovery.is_some() {
+                            auto_recovery_done = true;
 
-                    match result {
+                            options.auto_recovery
+                        } else {
+                            options.pending_timeout
+                        };
+
+                        let pending_timeout_arg = match pending_timeout {
+                            Some(timeout) => timeout.to_string(),
+                            None => "nil".to_string(),
+                        };
+
+                        debug!(
+                            "Consumer Task '{}' fetching messages with timeout {}",
+                            queue_id, pending_timeout_arg
+                        );
+
+                        client
+                            .evalsha::<Vec<(String, HashMap<String, Value>, u32)>, _, _, _>(
+                                &script_hash,
+                                &[&stream],
+                                &[&group, &queue_id, &pending_timeout_arg, "1"],
+                            )
+                            .await
+                    };
+
+                    // Determine if we need to sleep (before using message_result in the match)
+                    let is_empty = match &message_result {
+                        Ok(msgs) => msgs.is_empty(),
+                        Err(_) => true,
+                    };
+
+                    match message_result {
                         Ok(messages) => {
-                            if !messages.is_empty() {
-                                // Process messages
-                                for (message_id, fields, retry_count) in messages {
-                                    Self::process_message(
-                                        client.clone(),
-                                        &stream,
-                                        &group,
-                                        consumer.clone(),
-                                        consumer_id.clone(),
-                                        message_id,
-                                        fields,
-                                        retry_count,
-                                        &options,
-                                        shutdown_rx.clone(),
-                                    )
-                                    .await;
-                                }
+                            for (message_id, fields, delivery_count) in messages {
+                                Self::process_message(
+                                    client.clone(),
+                                    &stream,
+                                    &group,
+                                    consumer.clone(),
+                                    queue_id.clone(),
+                                    message_id,
+                                    fields,
+                                    delivery_count,
+                                    &options,
+                                    shutdown_clone.clone(),
+                                    delivery_holder.clone(),
+                                )
+                                .await;
                             }
                         }
                         Err(e) => {
                             error!("Error executing Lua script: {}", e);
                         }
                     }
-                }
+
+                    // Small sleep to avoid CPU spin when no messages
+                    if is_empty {
+                        sleep(Duration::from_millis(options.poll_interval())).await;
+                    }
+                } => {}
             }
         }
 
-        debug!("Consumer Task '{}' terminated.", consumer_id);
+        // Unregister from prefetch system when shutting down
+        if let Some(_) = &consumer_channel {
+            if let Some(buffer) = &message_buffer {
+                // Use parameter instead of self
+                buffer.unregister_consumer(&consumer_id).await;
+            }
+        }
+
+        debug!("Consumer Task '{}' terminated.", queue_id);
     }
 
     async fn process_message(
@@ -300,12 +573,13 @@ where
         stream: &str,
         group: &str,
         consumer: Arc<dyn Consumer<Message = M>>,
-        consumer_id: String,
+        queue_id: String,
         message_id: String,
         fields: HashMap<String, Value>,
-        retry_count: u32,
+        delivery_count: u32,
         options: &QueueOptions,
         shutdown_rx: Receiver<bool>,
+        delivery_holder: Option<Arc<Mutex<Option<Delivery<M>>>>>,
     ) {
         if *shutdown_rx.borrow() {
             debug!("Shutdown signal received before processing message {}, returning immediately without acking.", message_id);
@@ -316,21 +590,29 @@ where
         if let Some(data) = fields.get("data") {
             match serde_json::from_value::<M>(data.clone()) {
                 Ok(message) => {
+                    // Use queue_id for delivery
                     let delivery = Delivery::new(
                         client.clone(),
                         stream.to_string(),
                         group.to_string(),
-                        consumer_id.clone(),
+                        queue_id.clone(),
                         message_id.clone(),
                         message,
                         options.max_retries(),
-                        retry_count,
+                        delivery_count,
                         options.delete_on_ack,
+                        options.retry_sync.clone(),
                     );
 
                     // If this is a manual queue (no pending_timeout), start keep-alive
                     if options.pending_timeout.is_none() {
                         delivery.start_keep_alive(options.poll_interval()).await;
+                    }
+
+                    // When processing a message, store the delivery in the holder if needed
+                    if let Some(holder) = &delivery_holder {
+                        let mut lock = holder.lock().await;
+                        *lock = Some(delivery.clone());
                     }
 
                     loop {
@@ -361,15 +643,19 @@ where
 
                                 delivery.set_error(e.clone()).await;
 
+                                // Add this line to determine if we should retry
                                 let should_retry = consumer.should_retry(&delivery).await;
 
                                 if should_retry {
                                     // Check if this is a manual queue scenario
                                     if options.pending_timeout.is_none() {
-                                        // Manual queue with retries: We handle retry in-process
-                                        // Increase retry_count after a failed attempt
-                                        delivery.inc_retry_count();
-
+                                        // Increase delivery_count after a failed attempt only for manual queue
+                                        if let Err(e) = delivery.inc_delivery_count().await {
+                                            error!(
+                                                "Error incrementing delivery count for message {}: {}",
+                                                message_id, e
+                                            );
+                                        }
                                         // Sleep if retry_delay is specified in retry_config
                                         if options.retry_delay() > 0 {
                                             sleep(Duration::from_millis(options.retry_delay()))
@@ -429,21 +715,23 @@ where
                             }
                         }
                     }
+
+                    // When message processing is done, clear the delivery
+                    if let Some(holder) = &delivery_holder {
+                        let mut lock = holder.lock().await;
+                        *lock = None;
+                    }
                 }
                 Err(e) => {
                     error!("Failed to deserialize message {}: {}", message_id, e);
                     // Acknowledge the message to remove it from the pending list
-                    let _ = client
-                        .xack::<i64, _, _, _>(stream, group, &message_id)
-                        .await;
+                    let _ = client.xack::<(), _, _, _>(stream, group, &message_id).await;
                 }
             }
         } else {
             error!("Message {} missing 'data' field", message_id);
             // Acknowledge the message to remove it from the pending list
-            let _ = client
-                .xack::<i64, _, _, _>(stream, group, &message_id)
-                .await;
+            let _ = client.xack::<(), _, _, _>(stream, group, &message_id).await;
         }
     }
 }

@@ -4,7 +4,7 @@ use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
     errors::{RmqError, RmqResult},
-    Queue, QueueOptions, RetryConfig,
+    Queue, QueueOptions, RetryConfig, RetrySyncPolicy,
 };
 
 pub struct QueueBuilder<M> {
@@ -90,6 +90,24 @@ where
     /// Convenience: set just the poll interval.
     pub fn poll_interval(mut self, ms: u64) -> Self {
         self.options.poll_interval = Some(ms);
+
+        self
+    }
+
+    /// Set the prefetch count - how many messages to prefetch from Redis
+    ///
+    /// - A value of 1 disables prefetching (direct Redis polling)
+    /// - Values above 1 enable prefetching with the specified batch size
+    /// - Higher values reduce CPU usage with many consumers
+    pub fn prefetch_count(mut self, count: u32) -> Self {
+        self.options.prefetch_count = Some(count);
+
+        self
+    }
+
+    /// Convenience: set the retry sync policy.
+    pub fn retry_sync(mut self, policy: RetrySyncPolicy) -> Self {
+        self.options.retry_sync = policy;
 
         self
     }

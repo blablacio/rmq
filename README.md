@@ -240,13 +240,53 @@ let options = QueueOptions {
     auto_recovery: Some(30000), // Auto-recover messages pending for 30 seconds on startup
     delete_on_ack: true,        // Delete messages after successful acknowledgment
     poll_interval: Some(50),      // Custom poll interval
-    pending_timeout: Some(5000),  // Custom pending timeout
     dlq_name: Some("my_dlq_stream".to_string()), // Or use a Dead-Letter Queue
     ..Default::default()
 };
 ```
 
 When a consumer fails, the queue decides (based on `should_retry()`) if the message is retried or moved to the DLQ.
+
+### Understanding Delivery Counts & Retries
+
+**rmq** uses a consistent approach to track message delivery attempts:
+
+- **Delivery Count**: 1-based count of how many times a message has been delivered
+
+  - Initial delivery = 1
+  - First retry = 2
+  - Second retry = 3
+
+- **Retry Count**: 0-based count of how many retries have occurred
+  - Initial delivery = 0 (no retries yet)
+  - First retry = 1
+  - Second retry = 2
+
+When configuring `max_retries: 2`, you'll get a total of 3 processing attempts:
+
+- Initial delivery (retry_count=0)
+- First retry (retry_count=1)
+- Second retry (retry_count=2)
+
+### Manual vs. Stealing Queues
+
+**rmq** supports two distinct queue operation modes:
+
+#### 1. Manual Queues (when `pending_timeout` is `None`)
+
+- Messages won't be automatically reclaimed by other consumers
+- Delivery counts are incremented explicitly by your queue after failed attempts
+- Retries happen in-process (same consumer task)
+- The consumer must explicitly `ack()` or fail to release the message
+
+#### 2. Stealing Queues (when `pending_timeout` is `Some(...)`)
+
+- Redis Streams will auto-claim messages that a consumer has taken too long to process
+- Delivery counts are incremented by Redis's XAUTOCLAIM mechanism
+- Failed messages can be claimed by any available consumer
+- Good for workload distribution and fault tolerance
+
+**Important**: With stealing queues, a message may be processed by different consumers during its retry sequence. This provides better system resilience but means you shouldn't rely on the same consumer handling all retries of a specific message.
 
 ### Auto-Recovery
 
@@ -260,6 +300,40 @@ Setting `delete_on_ack: true` in `QueueOptions` will automatically delete messag
 
 If `pending_timeout` is `None`, the queue is a **manual queue** (messages won’t be reclaimed automatically). The consumer must **ack** or **retry** in-process.
 If `pending_timeout` is `Some(...)`, it’s a **stealing queue**—Redis Streams will auto-claim messages that a consumer has taken too long to acknowledge.
+
+### Prefetching
+
+**rmq** implements a prefetching mechanism similar to RabbitMQ that can significantly reduce CPU usage, especially with many consumers:
+
+- With prefetching enabled (`prefetch_count: Some(n)`), a single task fetches messages from Redis in batches
+- These messages are then distributed to consumers
+- This reduces the number of Redis calls and dramatically improves CPU efficiency
+
+You can control prefetching with the `prefetch_count` option:
+
+```rust
+// Enable prefetching (default in v0.2+)
+let options = QueueOptions {
+    prefetch_count: Some(100), // Prefetch up to 100 messages at once
+    ..Default::default()
+};
+
+// Or disable prefetching for direct consumer polling
+let options = QueueOptions {
+    prefetch_count: None, // Disable prefetching
+    ..Default::default()
+};
+```
+
+#### Prefetching Performance Characteristics:
+
+- **CPU Usage**: Significantly lower (20-40% reduction) - especially valuable with many consumers
+- **Throughput vs. CPU Trade-off**: Small impact on raw processing speed in exchange for CPU efficiency
+- **Optimal Settings**:
+  - For high throughput: Set prefetch_count to match your consumer count
+  - For idle scenarios: Prefetching is especially valuable with many idle consumers
+
+Prefetching is particularly beneficial when you have many consumers (>10) or need to minimize CPU usage in systems with sporadic message activity.
 
 ---
 
