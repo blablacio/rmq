@@ -3210,3 +3210,135 @@ async fn test_stealing_queue_retry_count_consistency() -> eyre::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_prefetch_buffer_size_limit() -> eyre::Result<()> {
+    // Setup test environment
+    let config = Config::from_url(&get_redis_url())?;
+    let client = Client::new(config, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+
+    let stream_name = "prefetch_buffer_test_stream";
+    let group_name = "prefetch_buffer_test_group";
+
+    let buffer_limit = 5;
+    let prefetch_batch_size = 20;
+    let message_count = 15; // More than buffer, less than prefetch count
+
+    // Queue with small buffer_size but larger prefetch_count
+    let options = QueueOptions {
+        prefetch_config: Some(PrefetchConfig {
+            count: prefetch_batch_size,
+            buffer_size: buffer_limit, // Small buffer
+        }),
+        poll_interval: Some(50), // Poll frequently
+        ..Default::default()
+    };
+
+    let queue = Queue::<TestMessage>::new(
+        client.clone(),
+        stream_name.to_string(),
+        Some(group_name.to_string()),
+        options,
+    )
+    .await?;
+
+    // Consumer that tracks concurrency
+    struct BufferSizeTestConsumer {
+        active_processing: Arc<AtomicU32>,
+        max_concurrency: Arc<AtomicU32>,
+        processed_count: Arc<AtomicU32>,
+        processing_delay_ms: u64,
+    }
+
+    #[async_trait]
+    impl Consumer for BufferSizeTestConsumer {
+        type Message = TestMessage;
+
+        async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
+            // Increment active count and update max concurrency
+            let current_active = self.active_processing.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_concurrency
+                .fetch_max(current_active, Ordering::SeqCst);
+
+            // Simulate processing time
+            sleep(Duration::from_millis(self.processing_delay_ms)).await;
+
+            // Decrement active count
+            self.active_processing.fetch_sub(1, Ordering::SeqCst);
+
+            // Increment total processed count
+            self.processed_count.fetch_add(1, Ordering::SeqCst);
+
+            delivery.ack().await?;
+            Ok(())
+        }
+    }
+
+    // Shared state for the consumer
+    let active_processing = Arc::new(AtomicU32::new(0));
+    let max_concurrency = Arc::new(AtomicU32::new(0));
+    let processed_count = Arc::new(AtomicU32::new(0));
+
+    // Register a single consumer instance
+    let consumer = BufferSizeTestConsumer {
+        active_processing: active_processing.clone(),
+        max_concurrency: max_concurrency.clone(),
+        processed_count: processed_count.clone(),
+        processing_delay_ms: 100, // 100ms processing time
+    };
+    queue.register_consumer(consumer).await?;
+
+    // Produce messages
+    for i in 0..message_count {
+        let msg = TestMessage {
+            content: format!("BufferTestMsg {}", i),
+        };
+        queue.produce(&msg).await?;
+    }
+
+    // Wait for all messages to be processed
+    let start = std::time::Instant::now();
+    while processed_count.load(Ordering::SeqCst) < message_count {
+        sleep(Duration::from_millis(50)).await;
+        if start.elapsed() > Duration::from_secs(20) {
+            // Timeout after 20 seconds
+            return Err(eyre::eyre!(
+                "Test timed out waiting for message processing. Processed: {}/{}",
+                processed_count.load(Ordering::SeqCst),
+                message_count
+            ));
+        }
+    }
+
+    // Verify results
+    let final_max_concurrency = max_concurrency.load(Ordering::SeqCst);
+    println!("Maximum observed concurrency: {}", final_max_concurrency);
+
+    // The maximum concurrency should be limited by the buffer size.
+    // Allow a small margin (e.g., +1 or +2) due to timing effects between receiving from buffer and starting processing.
+    assert!(
+        final_max_concurrency <= (buffer_limit + 2) as u32,
+        "Max concurrency ({}) should be close to buffer size ({}), allowing for minor timing variations",
+        final_max_concurrency,
+        buffer_limit
+    );
+    // It should definitely be less than the prefetch count if the buffer is the bottleneck
+    assert!(
+        final_max_concurrency < prefetch_batch_size as u32,
+        "Max concurrency ({}) should be less than the prefetch count ({}) if buffer limits",
+        final_max_concurrency,
+        prefetch_batch_size
+    );
+
+    // Cleanup
+    queue.shutdown(Some(2000)).await;
+    client
+        .xgroup_destroy::<String, _, _>(stream_name, group_name)
+        .await?;
+    client.del::<String, _>(stream_name).await?;
+
+    Ok(())
+}
