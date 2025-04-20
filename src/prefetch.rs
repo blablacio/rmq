@@ -59,10 +59,11 @@ impl<M> MessageBuffer<M> {
         let (sender, receiver) = mpsc::channel(self.capacity);
 
         // Register the sender
-        {
-            let mut consumers = self.consumers.write().await;
-            consumers.insert(consumer_id, sender);
-        }
+        let mut consumers = self.consumers.write().await;
+        consumers.insert(consumer_id, sender);
+
+        // Drop the write lock to allow other consumers to register
+        drop(consumers);
 
         // Check if there are messages in overflow that can be sent to this consumer
         self.distribute_overflow().await;

@@ -305,33 +305,53 @@ If `pending_timeout` is `Some(...)`, it’s a **stealing queue**—Redis Streams
 
 **rmq** implements a prefetching mechanism similar to RabbitMQ that can significantly reduce CPU usage, especially with many consumers:
 
-- With prefetching enabled (`prefetch_count: Some(n)`), a single task fetches messages from Redis in batches
-- These messages are then distributed to consumers
-- This reduces the number of Redis calls and dramatically improves CPU efficiency
+- With prefetching enabled (`prefetch_config: Some(...)`), a single task fetches messages from Redis in batches.
+- These messages are then distributed to consumers via internal channels.
+- This reduces the number of Redis calls and dramatically improves CPU efficiency.
 
-You can control prefetching with the `prefetch_count` option:
+You can control prefetching with the `prefetch_config` option, which takes a `PrefetchConfig` struct:
 
 ```rust
+use rmq::{QueueOptions, PrefetchConfig};
+
 // Enable prefetching (default in v0.2+)
 let options = QueueOptions {
-    prefetch_count: Some(100), // Prefetch up to 100 messages at once
+    prefetch_config: Some(PrefetchConfig {
+        count: 100,      // Prefetch up to 100 messages at once
+        buffer_size: 50, // Buffer up to 50 messages per consumer channel
+    }),
     ..Default::default()
 };
 
 // Or disable prefetching for direct consumer polling
 let options = QueueOptions {
-    prefetch_count: None, // Disable prefetching
+    prefetch_config: None, // Disable prefetching
     ..Default::default()
 };
 ```
 
+You can also set these values individually using the `QueueBuilder`:
+
+```rust
+use rmq::QueueBuilder;
+
+let queue = QueueBuilder::<String>::new()
+    .url("redis://127.0.0.1:6379")
+    .stream("my_stream")
+    .group("my_group")
+    .prefetch_count(150) // Set the number of messages to prefetch
+    .buffer_size(75)     // Set the buffer size for each consumer
+    .build()
+    .await?;
+```
+
 #### Prefetching Performance Characteristics:
 
-- **CPU Usage**: Significantly lower (20-40% reduction) - especially valuable with many consumers
-- **Throughput vs. CPU Trade-off**: Small impact on raw processing speed in exchange for CPU efficiency
+- **CPU Usage**: Significantly lower (20-40% reduction observed in tests) - especially valuable with many consumers.
+- **Throughput vs. CPU Trade-off**: May have a small impact on raw processing speed in exchange for CPU efficiency.
 - **Optimal Settings**:
-  - For high throughput: Set prefetch_count to match your consumer count
-  - For idle scenarios: Prefetching is especially valuable with many idle consumers
+  - For high throughput: Set `prefetch_config.count` roughly equal to your expected active consumer count. Adjust `buffer_size` based on message processing time and desired latency.
+  - For idle scenarios: Prefetching is especially valuable with many idle consumers, keeping CPU usage low.
 
 Prefetching is particularly beneficial when you have many consumers (>10) or need to minimize CPU usage in systems with sporadic message activity.
 

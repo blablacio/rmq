@@ -10,6 +10,12 @@ pub struct RetryConfig {
     pub retry_delay: u64, // in milliseconds
 }
 
+#[derive(Clone, Debug)]
+pub struct PrefetchConfig {
+    pub count: u32,
+    pub buffer_size: usize,
+}
+
 #[derive(Clone)]
 pub struct QueueOptions {
     pub pending_timeout: Option<u64>, // Timeout after which a message is reclaimed
@@ -18,7 +24,7 @@ pub struct QueueOptions {
     pub dlq_name: Option<String>,     // Optional DLQ stream name
     pub auto_recovery: Option<u64>,   // Automatically recover messages on startup after timeout
     pub delete_on_ack: bool,          // Automatically delete messages from queue after ack
-    pub prefetch_count: Option<u32>,  // None=disabled, Some(n)=enabled with batch size n
+    pub prefetch_config: Option<PrefetchConfig>, // Configuration for prefetching messages
     pub retry_sync: RetrySyncPolicy,  // When to sync retry counts with Redis
 }
 
@@ -38,7 +44,11 @@ impl Default for QueueOptions {
             dlq_name: None,
             auto_recovery: None,
             delete_on_ack: false,
-            prefetch_count: Some(100), // Enable prefetching with a reasonable batch size
+            prefetch_config: Some(PrefetchConfig {
+                // Enable prefetching by default
+                count: 100,      // Default prefetch count
+                buffer_size: 50, // Default consumer buffer size
+            }),
             retry_sync: RetrySyncPolicy::OnEachRetry, // Keep current behavior as default
         }
     }

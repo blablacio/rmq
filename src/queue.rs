@@ -36,7 +36,7 @@ pub struct Queue<M> {
     shutdown_tx: Sender<bool>,
     shutdown_rx: Receiver<bool>,
     tasks: Arc<DashMap<Uuid, TaskState<M>>>, // Store both handle and delivery
-    message_buffer: Arc<MessageBuffer<M>>,
+    message_buffer: Option<Arc<MessageBuffer<M>>>, // Make this optional
     prefetch_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     queue_id: String, // Unique queue ID for all operations
     marker: PhantomData<M>,
@@ -88,7 +88,13 @@ where
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let message_buffer = Arc::new(MessageBuffer::new(50)); // 50 messages per consumer
+
+        // Initialize MessageBuffer only if prefetching is enabled
+        let message_buffer = if let Some(config) = &options.prefetch_config {
+            Some(Arc::new(MessageBuffer::new(config.buffer_size)))
+        } else {
+            None
+        };
 
         // Create a single consumer ID for all operations with this queue
         // Format: "queue-{group_name}-{unique_id}"
@@ -103,15 +109,14 @@ where
             tasks: Arc::new(DashMap::new()),
             shutdown_tx,
             shutdown_rx,
-            message_buffer,
+            message_buffer, // Assign the Option<Arc<MessageBuffer>>
             prefetch_task: Arc::new(Mutex::new(None)),
             queue_id,
             marker: PhantomData,
         };
 
-        // Start the prefetch task
-        if let Some(_) = options.prefetch_count {
-            // Start prefetch task with the specified count
+        // Start the prefetch task only if prefetch_config is Some (and thus message_buffer is Some)
+        if options.prefetch_config.is_some() {
             let prefetch_task = queue.start_prefetch_task().await;
             *queue.prefetch_task.lock().await = Some(prefetch_task);
         }
@@ -125,11 +130,21 @@ where
         let group = self.group.clone();
         let options = self.options.clone();
         let script_hash = self.script_hash.clone();
-        let message_buffer = self.message_buffer.clone();
+        let message_buffer = self
+            .message_buffer
+            .clone()
+            .expect("Prefetch task started without message buffer");
         // Use the queue's consumer ID instead of generating a new one
         let prefetcher_id = self.queue_id.clone();
         let mut shutdown_rx = self.shutdown_rx.clone();
         let mut auto_recovery_done = false;
+
+        // Ensure prefetch config exists before starting the task
+        let prefetch_config = self
+            .options
+            .prefetch_config
+            .clone()
+            .expect("Prefetch task started without prefetch config");
 
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_millis(options.poll_interval()));
@@ -151,8 +166,8 @@ where
                         }
 
                         // Calculate the appropriate prefetch amount based on consumer count
-                        // This matches the original RMQ's formula: prefetchLimit + numConsumers
-                        let effective_prefetch = options.prefetch_count.unwrap_or(0) + consumer_count as u32;
+                        // Use the count from the captured prefetch_config
+                        let effective_prefetch = prefetch_config.count + consumer_count as u32;
 
                         // Get current buffer state
                         let current_len = message_buffer.get_overflow_size().await;
@@ -164,7 +179,9 @@ where
                         }
 
                         // Calculate how many messages to fetch to fill the buffer
-                        let fetch_count = effective_prefetch - current_len as u32;
+                        // Ensure subtraction doesn't underflow
+                        let fetch_count = effective_prefetch.saturating_sub(current_len as u32);
+
 
                         // Skip tiny fetches
                         if fetch_count < 10 {
@@ -409,16 +426,18 @@ where
         // Use the queue's ID for Redis operations
         let queue_id = self.queue_id.clone();
 
-        // Register with prefetch system using the consumer-specific ID
-        let consumer_channel = match options.prefetch_count {
-            Some(_) => Some(self.message_buffer.register_consumer(consumer_id).await),
-            None => None,
+        // Register with prefetch system only if prefetch_config is Some
+        let consumer_channel = if let Some(buffer) = &self.message_buffer {
+            Some(buffer.register_consumer(consumer_id).await)
+        } else {
+            None
         };
 
-        // Add message_buffer to pass to consumer_task
-        let message_buffer = match options.prefetch_count {
-            Some(_) => Some(self.message_buffer.clone()),
-            None => None,
+        // Pass message_buffer only if prefetch_config is Some
+        let message_buffer = if options.prefetch_config.is_some() {
+            Some(self.message_buffer.clone().unwrap())
+        } else {
+            None
         };
 
         let handle = tokio::spawn(async move {
@@ -558,9 +577,10 @@ where
         }
 
         // Unregister from prefetch system when shutting down
-        if let Some(_) = &consumer_channel {
-            if let Some(buffer) = &message_buffer {
-                // Use parameter instead of self
+        if let Some(buffer) = &message_buffer {
+            // Check if buffer exists
+            if consumer_channel.is_some() {
+                // Check if it was actually registered
                 buffer.unregister_consumer(&consumer_id).await;
             }
         }

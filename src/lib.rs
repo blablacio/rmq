@@ -10,5 +10,5 @@ pub use builder::QueueBuilder;
 pub use consumer::Consumer;
 pub use delivery::Delivery;
 pub use errors::{ConsumerError, RmqError, RmqResult};
-pub use options::{QueueDefaults, QueueOptions, RetryConfig, RetrySyncPolicy};
+pub use options::{PrefetchConfig, QueueDefaults, QueueOptions, RetryConfig, RetrySyncPolicy};
 pub use queue::Queue;

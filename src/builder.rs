@@ -4,6 +4,7 @@ use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
     errors::{RmqError, RmqResult},
+    options::PrefetchConfig,
     Queue, QueueOptions, RetryConfig, RetrySyncPolicy,
 };
 
@@ -99,8 +100,29 @@ where
     /// - A value of 1 disables prefetching (direct Redis polling)
     /// - Values above 1 enable prefetching with the specified batch size
     /// - Higher values reduce CPU usage with many consumers
+    ///
+    /// This initializes or updates the prefetch configuration.
     pub fn prefetch_count(mut self, count: u32) -> Self {
-        self.options.prefetch_count = Some(count);
+        let buffer_size = self.options.prefetch_config.as_ref().map_or(
+            QueueOptions::default().prefetch_config.unwrap().buffer_size, // Use default buffer size if not set
+            |config| config.buffer_size,
+        );
+        self.options.prefetch_config = Some(PrefetchConfig { count, buffer_size });
+
+        self
+    }
+
+    /// Set the consumer buffer size when prefetching is enabled.
+    ///
+    /// This determines the capacity of the channel buffer for each consumer.
+    ///
+    /// This initializes or updates the prefetch configuration.
+    pub fn buffer_size(mut self, buffer_size: usize) -> Self {
+        let count = self.options.prefetch_config.as_ref().map_or(
+            QueueOptions::default().prefetch_config.unwrap().count, // Use default count if not set
+            |config| config.count,
+        );
+        self.options.prefetch_config = Some(PrefetchConfig { count, buffer_size });
 
         self
     }

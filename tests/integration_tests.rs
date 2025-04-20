@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use fred::prelude::{Client, ClientLike, Config, KeysInterface, StreamsInterface};
 use rmq::{
-    Consumer, ConsumerError, Delivery, Queue, QueueBuilder, QueueOptions, RetryConfig,
-    RetrySyncPolicy,
+    Consumer, ConsumerError, Delivery, PrefetchConfig, Queue, QueueBuilder, QueueOptions,
+    RetryConfig, RetrySyncPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1951,7 +1951,10 @@ async fn test_prefetching_functionality() -> eyre::Result<()> {
 
     // Queue with prefetching enabled
     let prefetch_options = QueueOptions {
-        prefetch_count: Some(10), // Enable prefetching with batch size 10
+        prefetch_config: Some(PrefetchConfig {
+            count: 10,
+            buffer_size: 1000,
+        }), // Use PrefetchConfig
         poll_interval: Some(100),
         ..Default::default()
     };
@@ -2174,7 +2177,7 @@ async fn test_prefetch_performance_comparison() -> eyre::Result<()> {
     let group_name1 = "no_prefetch_perf_group";
 
     let no_prefetch_options = QueueOptions {
-        prefetch_count: None, // Disable prefetching
+        prefetch_config: None, // Disable prefetching
         poll_interval: Some(100),
         ..Default::default()
     };
@@ -2199,7 +2202,10 @@ async fn test_prefetch_performance_comparison() -> eyre::Result<()> {
     let group_name2 = "prefetch_perf_group";
 
     let prefetch_options = QueueOptions {
-        prefetch_count: Some(consumer_count), // Reasonable batch size
+        prefetch_config: Some(PrefetchConfig {
+            count: consumer_count,
+            buffer_size: 1000,
+        }), // Use PrefetchConfig
         poll_interval: Some(100),
         ..Default::default()
     };
@@ -2310,7 +2316,10 @@ async fn test_retry_sync_policy_with_prefetch() -> eyre::Result<()> {
 
     // Test with OnShutdown retry sync policy
     let options = QueueOptions {
-        prefetch_count: Some(10),
+        prefetch_config: Some(PrefetchConfig {
+            count: 10,
+            buffer_size: 1000,
+        }), // Use PrefetchConfig
         retry_config: Some(RetryConfig {
             max_retries: 3,
             retry_delay: 0,
@@ -2428,7 +2437,10 @@ async fn test_concurrent_consumers_with_prefetch() -> eyre::Result<()> {
 
     // Queue with prefetching
     let options = QueueOptions {
-        prefetch_count: Some(25), // Larger prefetch for multiple consumers
+        prefetch_config: Some(PrefetchConfig {
+            count: 25,
+            buffer_size: 1000,
+        }), // Use PrefetchConfig
         poll_interval: Some(50),
         pending_timeout: Some(1000), // Enable stealing
         ..Default::default()
@@ -2531,7 +2543,10 @@ async fn test_idle_consumer_cpu_usage() -> eyre::Result<()> {
 
     // Test with prefetching
     let prefetch_options = QueueOptions {
-        prefetch_count: Some(consumer_count), // Match consumer count
+        prefetch_config: Some(PrefetchConfig {
+            count: consumer_count,
+            buffer_size: 1000,
+        }), // Use PrefetchConfig
         poll_interval: Some(100),
         ..Default::default()
     };
@@ -2690,7 +2705,10 @@ async fn test_prefetch_retry_count_consistency() -> eyre::Result<()> {
     // Key change: Use OnEachRetry policy to ensure immediate sync
     let options = QueueOptions {
         pending_timeout: None,
-        prefetch_count: Some(10),
+        prefetch_config: Some(PrefetchConfig {
+            count: 10,
+            buffer_size: 1000,
+        }), // Use PrefetchConfig
         retry_config: Some(RetryConfig {
             max_retries: 3,
             retry_delay: 100, // Small delay to ensure retry processing completes
@@ -2878,7 +2896,7 @@ async fn test_stealing_queue_retry_count_consistency() -> eyre::Result<()> {
     // Key difference: Use a STEALING queue with pending_timeout set
     let options = QueueOptions {
         pending_timeout: Some(300), // 300ms timeout for auto-claiming
-        prefetch_count: None,       // Disable prefetching to simplify test
+        prefetch_config: None,      // Disable prefetching to simplify test
         retry_config: Some(RetryConfig {
             max_retries: 3,
             retry_delay: 200, // Small delay to ensure stealing can occur
