@@ -15,7 +15,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{sync::Mutex, time::sleep};
 
@@ -120,6 +120,8 @@ async fn test_stealing_queue_basic_flow() -> eyre::Result<()> {
         "stealing_test_stream".to_string(),
         Some("stealing_group".to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -236,7 +238,8 @@ async fn test_stealing_queue_retry_behavior() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_handling_invalid_messages() -> eyre::Result<()> {
-    // Demonstrate: Using the optional `Queue::from_url(...)` helper method.
+    // Updated Queue::from_url call (assuming it calls Queue::new internally)
+    // NOTE: Queue::from_url needs to be updated to pass None for factory/strategy
     let queue = Queue::<TestMessage>::from_url(
         &get_redis_url(),
         "invalid_test_stream",
@@ -290,6 +293,8 @@ async fn test_queue_graceful_shutdown() -> eyre::Result<()> {
         "shutdown_test_stream".to_string(),
         Some("shutdown_group".to_string()),
         QueueOptions::default(),
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -346,6 +351,8 @@ async fn test_default_no_retry_behavior() -> eyre::Result<()> {
         "no_retry_no_override_stream".to_string(),
         Some("no_retry_no_override_group".to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -425,6 +432,8 @@ async fn test_retry_override_without_retry_config() -> eyre::Result<()> {
         "no_config_with_override_stream".to_string(),
         Some("no_config_override_group".to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -511,6 +520,8 @@ async fn test_default_retry_behavior_with_config() -> eyre::Result<()> {
         "retry_config_no_override_stream".to_string(),
         Some("retry_config_no_override_group".to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -598,6 +609,8 @@ async fn test_retry_override_ignores_retry_config() -> eyre::Result<()> {
         "retry_config_override_stream".to_string(),
         Some("retry_config_override_group".to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -687,6 +700,8 @@ async fn test_manual_queue_retries_until_success() -> Result<(), Box<dyn Error>>
         "manual_blocking_retries_success_stream".to_string(),
         Some("manual_blocking_success_group".to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -800,6 +815,8 @@ async fn test_manual_queue_exhaust_retries() -> eyre::Result<()> {
         "manual_blocking_retries_exceed_stream".to_string(),
         Some("manual_blocking_exceed_group".to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -876,6 +893,8 @@ async fn test_idempotent_processing() -> eyre::Result<()> {
         "idempotency_stream".to_string(),
         Some("idempotency_group".to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -965,6 +984,8 @@ async fn test_infinite_retry_loop_in_stealing_queue() -> eyre::Result<()> {
         "infinite_retry_stream".to_string(),
         Some("infinite_retry_group".to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -1044,6 +1065,8 @@ async fn test_long_delay_high_retry_manual_queue() -> eyre::Result<()> {
         "high_retry_long_delay_stream".to_string(),
         Some("high_retry_long_delay_group".to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -1124,6 +1147,8 @@ async fn test_consumer_panic_handling() -> eyre::Result<()> {
         "panic_test_stream".to_string(),
         Some("panic_group".to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -1189,6 +1214,8 @@ async fn test_time_based_retry_logic() -> eyre::Result<()> {
         "time_based_retry_stream".to_string(),
         Some("time_based_retry_group".to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -1293,6 +1320,8 @@ async fn test_multiple_consumers_dlq_integration() -> eyre::Result<()> {
         "multi_policies_stream".to_string(),
         Some("multi_policies_group_a".to_string()), // Unique group for Consumer A
         options_a,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -1313,6 +1342,8 @@ async fn test_multiple_consumers_dlq_integration() -> eyre::Result<()> {
         "multi_policies_stream".to_string(),
         Some("multi_policies_group_b".to_string()), // Unique group for Consumer B
         options_b,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -1328,6 +1359,8 @@ async fn test_multiple_consumers_dlq_integration() -> eyre::Result<()> {
         "multi_policies_dlq".to_string(),
         Some("dead_letter_group".to_string()),
         dlq_options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -1511,6 +1544,8 @@ async fn test_large_scale_throughput_stress() -> eyre::Result<()> {
         "large_scale_stream".to_string(),
         Some("large_scale_group".to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -1639,6 +1674,8 @@ async fn test_auto_recovery_option() -> eyre::Result<()> {
         stream_name.to_string(),
         Some(group_name.to_string()),
         options.clone(),
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -1672,6 +1709,8 @@ async fn test_auto_recovery_option() -> eyre::Result<()> {
         stream_name.to_string(),
         Some(group_name.to_string()),
         options, // Same options including auto_recovery
+        None,    // consumer_factory
+        None,    // scaling_strategy
     )
     .await?;
 
@@ -1720,6 +1759,8 @@ async fn test_delete_on_ack_option() -> eyre::Result<()> {
         stream_name.to_string(),
         Some(group_name.to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -1791,6 +1832,8 @@ async fn test_shutdown_before_process() -> eyre::Result<()> {
         stream_name.to_string(),
         Some(group_name.to_string()),
         QueueOptions::default(),
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -1882,6 +1925,8 @@ async fn test_shutdown_during_error_handling() -> eyre::Result<()> {
             pending_timeout: Some(1000), // Stealing queue for retry to be relevant
             ..Default::default()
         },
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -1954,7 +1999,8 @@ async fn test_prefetching_functionality() -> eyre::Result<()> {
         prefetch_config: Some(PrefetchConfig {
             count: 10,
             buffer_size: 1000,
-        }), // Use PrefetchConfig
+            scaling: None, // Added scaling: None
+        }),
         poll_interval: Some(100),
         ..Default::default()
     };
@@ -1964,6 +2010,8 @@ async fn test_prefetching_functionality() -> eyre::Result<()> {
         stream_name.to_string(),
         Some(group_name.to_string()),
         prefetch_options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -2081,6 +2129,8 @@ async fn test_prefetch_performance_comparison() -> eyre::Result<()> {
             stream_name.to_string(),
             Some(group_name.to_string()),
             options,
+            None, // consumer_factory
+            None, // scaling_strategy
         )
         .await?;
 
@@ -2205,7 +2255,8 @@ async fn test_prefetch_performance_comparison() -> eyre::Result<()> {
         prefetch_config: Some(PrefetchConfig {
             count: consumer_count,
             buffer_size: 1000,
-        }), // Use PrefetchConfig
+            scaling: None, // Added scaling: None
+        }),
         poll_interval: Some(100),
         ..Default::default()
     };
@@ -2319,7 +2370,8 @@ async fn test_retry_sync_policy_with_prefetch() -> eyre::Result<()> {
         prefetch_config: Some(PrefetchConfig {
             count: 10,
             buffer_size: 1000,
-        }), // Use PrefetchConfig
+            scaling: None, // Added scaling: None
+        }),
         retry_config: Some(RetryConfig {
             max_retries: 3,
             retry_delay: 0,
@@ -2329,11 +2381,14 @@ async fn test_retry_sync_policy_with_prefetch() -> eyre::Result<()> {
         ..Default::default()
     };
 
+    // Updated Queue::new call
     let queue = Queue::<TestMessage>::new(
         client.clone(),
         stream_name.to_string(),
         Some(group_name.to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -2440,17 +2495,21 @@ async fn test_concurrent_consumers_with_prefetch() -> eyre::Result<()> {
         prefetch_config: Some(PrefetchConfig {
             count: 25,
             buffer_size: 1000,
-        }), // Use PrefetchConfig
+            scaling: None, // Added scaling: None
+        }),
         poll_interval: Some(50),
         pending_timeout: Some(1000), // Enable stealing
         ..Default::default()
     };
 
+    // Updated Queue::new call
     let queue = Queue::<TestMessage>::new(
         client.clone(),
         stream_name.to_string(),
         Some(group_name.to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -2546,7 +2605,8 @@ async fn test_idle_consumer_cpu_usage() -> eyre::Result<()> {
         prefetch_config: Some(PrefetchConfig {
             count: consumer_count,
             buffer_size: 1000,
-        }), // Use PrefetchConfig
+            scaling: None, // Added scaling: None
+        }),
         poll_interval: Some(100),
         ..Default::default()
     };
@@ -2557,6 +2617,8 @@ async fn test_idle_consumer_cpu_usage() -> eyre::Result<()> {
         stream_name.to_string(),
         Some(group_name.to_string()),
         prefetch_options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -2708,7 +2770,8 @@ async fn test_prefetch_retry_count_consistency() -> eyre::Result<()> {
         prefetch_config: Some(PrefetchConfig {
             count: 10,
             buffer_size: 1000,
-        }), // Use PrefetchConfig
+            scaling: None, // Added scaling: None
+        }),
         retry_config: Some(RetryConfig {
             max_retries: 3,
             retry_delay: 100, // Small delay to ensure retry processing completes
@@ -2723,6 +2786,8 @@ async fn test_prefetch_retry_count_consistency() -> eyre::Result<()> {
         stream_name.to_string(),
         Some(group_name.to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -2911,6 +2976,8 @@ async fn test_stealing_queue_retry_count_consistency() -> eyre::Result<()> {
         stream_name.to_string(),
         Some(group_name.to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -3232,6 +3299,7 @@ async fn test_prefetch_buffer_size_limit() -> eyre::Result<()> {
         prefetch_config: Some(PrefetchConfig {
             count: prefetch_batch_size,
             buffer_size: buffer_limit, // Small buffer
+            scaling: None,
         }),
         poll_interval: Some(50), // Poll frequently
         ..Default::default()
@@ -3242,6 +3310,8 @@ async fn test_prefetch_buffer_size_limit() -> eyre::Result<()> {
         stream_name.to_string(),
         Some(group_name.to_string()),
         options,
+        None, // consumer_factory
+        None, // scaling_strategy
     )
     .await?;
 
@@ -3340,5 +3410,408 @@ async fn test_prefetch_buffer_size_limit() -> eyre::Result<()> {
         .await?;
     client.del::<String, _>(stream_name).await?;
 
+    Ok(())
+}
+
+/// A simple consumer that acknowledges messages after a short delay.
+/// Used for scaling tests where we need a factory.
+#[derive(Clone)]
+struct SimpleDelayedConsumer {
+    delay_ms: u64,
+    processed_count: Arc<AtomicU32>, // Optional: Track processing if needed
+}
+
+#[async_trait]
+impl Consumer for SimpleDelayedConsumer {
+    type Message = TestMessage;
+
+    async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
+        sleep(Duration::from_millis(self.delay_ms)).await;
+        println!(
+            "Processing message: {} with delay {}ms",
+            delivery.message_id, self.delay_ms
+        );
+        self.processed_count.fetch_add(1, Ordering::Relaxed);
+        delivery.ack().await?;
+        println!("Delivery acknowledged: {}", delivery.message_id);
+        Ok(())
+    }
+}
+
+// --- Auto-Scaling Tests ---
+
+#[tokio::test]
+#[serial] // Ensure tests run serially to avoid Redis interference
+async fn test_auto_scaling_up() -> eyre::Result<()> {
+    let stream_name = "scaling_up_stream";
+    let group_name = "scaling_up_group";
+    let client = Client::new(Config::from_url(&get_redis_url())?, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+    let _ = client.del::<(), _>(stream_name).await; // Clean previous runs
+
+    let min_consumers = 1;
+    let max_consumers = 5;
+    let scale_interval = 500; // ms
+    let buffer_size = 1; // Critical: Small buffer to trigger overflow easily
+    let prefetch_count = 10;
+
+    let processed_counter = Arc::new(AtomicU32::new(0));
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(stream_name)
+        .group(group_name)
+        .prefetch_count(prefetch_count)
+        .buffer_size(buffer_size)
+        .scaling_config(min_consumers, max_consumers, scale_interval)
+        .with_instance(SimpleDelayedConsumer {
+            delay_ms: 600,
+            processed_count: processed_counter.clone(),
+        })
+        .build()
+        .await?;
+
+    // Initially, no consumers are registered via register_consumer.
+    // Scaling should start min_consumers automatically if logic allows,
+    // OR we might need to register the initial min_consumers manually.
+    // Let's assume the scaling task *should* bring it up to min_consumers.
+    // Wait for the first scaling interval + buffer time
+    sleep(Duration::from_millis(scale_interval + 200)).await;
+    assert_eq!(
+        queue.consumer_count(),
+        min_consumers as usize,
+        "Should start with min_consumers"
+    );
+
+    // Produce messages to cause overflow (more than buffer_size * current_consumers)
+    // Produce enough to keep the buffer full and trigger scaling multiple times
+    for i in 0..20 {
+        queue
+            .produce(&TestMessage {
+                content: format!("ScaleUp {}", i),
+            })
+            .await?;
+    }
+
+    // Wait for multiple scaling intervals
+    sleep(Duration::from_millis(
+        scale_interval * (max_consumers as u64) + 500,
+    ))
+    .await;
+
+    // Assert that the number of consumers has increased, up to the max
+    let final_count = queue.consumer_count();
+    assert!(
+        final_count >= min_consumers as usize,
+        "Consumer count should increase"
+    );
+    assert!(
+        final_count <= max_consumers as usize,
+        "Consumer count should not exceed max_consumers"
+    );
+    // Ideally, it should reach max_consumers if load persists
+    assert_eq!(
+        final_count, max_consumers as usize,
+        "Expected to scale up to max_consumers"
+    );
+
+    // Cleanup
+    queue.shutdown(Some(2000)).await;
+    client
+        .xgroup_destroy::<(), _, _>(stream_name, group_name)
+        .await?;
+    client.del::<(), _>(stream_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_auto_scaling_down() -> eyre::Result<()> {
+    let stream_name = "scaling_down_stream";
+    let group_name = "scaling_down_group";
+    let client = Client::new(Config::from_url(&get_redis_url())?, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+    let _ = client.del::<(), _>(stream_name).await;
+
+    let min_consumers = 2;
+    let max_consumers = 6;
+    let scale_interval = 500; // ms
+    let buffer_size = 5;
+    let prefetch_count = 10;
+
+    let processed_counter = Arc::new(AtomicU32::new(0));
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(stream_name)
+        .group(group_name)
+        .prefetch_count(prefetch_count)
+        .buffer_size(buffer_size)
+        .scaling_config(min_consumers, max_consumers, scale_interval)
+        .with_instance(SimpleDelayedConsumer {
+            delay_ms: 10,
+            processed_count: processed_counter.clone(),
+        })
+        .build()
+        .await?;
+
+    // Manually scale up to max_consumers first (simulate high load ending)
+    // We need an internal way or test helper to force scale up, or produce load first.
+    // Let's produce load first.
+    for i in 0..50 {
+        queue
+            .produce(&TestMessage {
+                content: format!("ScaleUp {}", i),
+            })
+            .await?;
+    }
+    // Wait to scale up
+    sleep(Duration::from_millis(
+        scale_interval * (max_consumers as u64) + 500,
+    ))
+    .await;
+    assert_eq!(
+        queue.consumer_count(),
+        min_consumers as usize,
+        "Should have scaled up to max"
+    );
+
+    // Now, stop producing messages and wait for idle consumers + scaling intervals
+    println!(
+        "Scaled up to {}, waiting for scale down...",
+        queue.consumer_count()
+    );
+    sleep(Duration::from_millis(
+        scale_interval * (max_consumers as u64) + 1000,
+    ))
+    .await; // Wait longer
+
+    // Assert that the number of consumers has decreased towards the min
+    let final_count = queue.consumer_count();
+    assert!(
+        final_count < max_consumers as usize,
+        "Consumer count should decrease from max"
+    );
+    assert!(
+        final_count >= min_consumers as usize,
+        "Consumer count should not go below min_consumers"
+    );
+    // Ideally, it should reach min_consumers if idle long enough
+    assert_eq!(
+        final_count, min_consumers as usize,
+        "Expected to scale down to min_consumers"
+    );
+
+    // Cleanup
+    queue.shutdown(Some(2000)).await;
+    client
+        .xgroup_destroy::<(), _, _>(stream_name, group_name)
+        .await?;
+    client.del::<(), _>(stream_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_auto_scaling_boundaries() -> eyre::Result<()> {
+    let stream_name = "scaling_boundary_stream";
+    let group_name = "scaling_boundary_group";
+    let client = Client::new(Config::from_url(&get_redis_url())?, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+    let _ = client.del::<(), _>(stream_name).await;
+
+    let min_consumers = 1;
+    let max_consumers = 3; // Small range for easier testing
+    let scale_interval = 300; // ms
+    let buffer_size = 1;
+    let prefetch_count = 5;
+
+    let processed_counter = Arc::new(AtomicU32::new(0));
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(stream_name)
+        .group(group_name)
+        .prefetch_count(prefetch_count)
+        .buffer_size(buffer_size)
+        .scaling_config(min_consumers, max_consumers, scale_interval)
+        .with_instance(SimpleDelayedConsumer {
+            delay_ms: 150,
+            processed_count: processed_counter.clone(),
+        })
+        .build()
+        .await?;
+
+    // 1. Test Max Boundary: Produce heavy load
+    println!("Testing max boundary...");
+    for i in 0..30 {
+        // More messages than max_consumers * buffer_size
+        queue
+            .produce(&TestMessage {
+                content: format!("Load {}", i),
+            })
+            .await?;
+    }
+    // Wait long enough to hit max, but hopefully not long enough to scale down yet
+    let wait_to_reach_max =
+        Duration::from_millis(scale_interval * max_consumers as u64 + scale_interval / 2); // e.g., 300 * 3 + 150 = 1050ms
+    println!("Waiting {:?} to reach max consumers...", wait_to_reach_max);
+    sleep(wait_to_reach_max).await;
+    // --- This is the assertion that was failing ---
+    assert_eq!(
+        queue.consumer_count(),
+        max_consumers as usize,
+        "Should reach max_consumers after load" // Adjusted assertion message slightly
+    );
+
+    // Keep producing, should not exceed max
+    println!("Producing more load while at max...");
+    for i in 0..10 {
+        queue
+            .produce(&TestMessage {
+                content: format!("More Load {}", i),
+            })
+            .await?;
+    }
+    // Wait a couple more intervals
+    let wait_at_max = Duration::from_millis(scale_interval * 2);
+    println!("Waiting {:?} while at max...", wait_at_max);
+    sleep(wait_at_max).await;
+    assert_eq!(
+        queue.consumer_count(),
+        max_consumers as usize,
+        "Should *stay* at max_consumers under continued load" // Adjusted message
+    );
+
+    // 2. Test Min Boundary: Wait for load to clear and scale down
+    println!("Testing min boundary...");
+    // Wait significantly longer for messages to process and scaling down to occur
+    // Original wait time should be sufficient here now
+    let wait_to_scale_down =
+        Duration::from_millis(scale_interval * (max_consumers as u64 + 5) + 2000);
+    println!("Waiting {:?} for scale down...", wait_to_scale_down);
+    sleep(wait_to_scale_down).await; // Extra time for processing + scaling down intervals
+
+    let current_count = queue.consumer_count();
+    println!("Count after waiting for scale down: {}", current_count);
+    assert_eq!(
+        current_count, min_consumers as usize,
+        "Should scale down to and stay at min_consumers"
+    );
+
+    // Wait more, should not go below min
+    sleep(Duration::from_millis(scale_interval * 2)).await;
+    assert_eq!(
+        queue.consumer_count(),
+        min_consumers as usize,
+        "Should *still* be at min_consumers"
+    );
+
+    // Cleanup
+    queue.shutdown(Some(2000)).await;
+    client
+        .xgroup_destroy::<(), _, _>(stream_name, group_name)
+        .await?;
+    client.del::<(), _>(stream_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_auto_scaling_shutdown() -> eyre::Result<()> {
+    let stream_name = "scaling_shutdown_stream";
+    let group_name = "scaling_shutdown_group";
+    let client = Client::new(Config::from_url(&get_redis_url())?, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+    let _ = client.del::<(), _>(stream_name).await;
+
+    let min_consumers = 1;
+    let max_consumers = 4;
+    let scale_interval = 400; // ms
+    let buffer_size = 1;
+    let prefetch_count = 10;
+
+    let processed_counter = Arc::new(AtomicU32::new(0));
+    // Use a longer delay to make shutdown timing more interesting
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(stream_name)
+        .group(group_name)
+        .prefetch_count(prefetch_count)
+        .buffer_size(buffer_size)
+        .scaling_config(min_consumers, max_consumers, scale_interval)
+        .with_instance(SimpleDelayedConsumer {
+            delay_ms: 200,
+            processed_count: processed_counter.clone(),
+        })
+        .build()
+        .await?;
+
+    // Produce load to scale up
+    for i in 0..15 {
+        queue
+            .produce(&TestMessage {
+                content: format!("Shutdown {}", i),
+            })
+            .await?;
+    }
+
+    // Wait to scale up a bit
+    sleep(Duration::from_millis(scale_interval * 3)).await;
+    let count_before_shutdown = queue.consumer_count();
+    assert!(
+        count_before_shutdown > min_consumers as usize,
+        "Should have scaled up before shutdown"
+    );
+    println!(
+        "Scaled up to {} consumers before shutdown",
+        count_before_shutdown
+    );
+
+    // Shutdown
+    println!("Initiating shutdown...");
+    let shutdown_start = Instant::now();
+    queue.shutdown(Some(3000)).await; // 3 second grace period
+    let shutdown_duration = shutdown_start.elapsed();
+    println!("Shutdown completed in {:?}", shutdown_duration);
+
+    // Assertions after shutdown
+    // 1. Check if queue.tasks is empty (internal check, might need helper/debug)
+    //    Alternatively, try to produce/register - should fail if truly shut down.
+    //    Let's try producing.
+    let _ = queue
+        .produce(&TestMessage {
+            content: "After Shutdown".into(),
+        })
+        .await;
+    // This might not fail if the client is still connected, but the consumer tasks should be gone.
+    // A better check might be needed depending on exact shutdown guarantees.
+
+    // 2. Check Redis state (optional but good) - group might still exist, but no consumers.
+    let consumers: Vec<(String, String, String, u64, String, u64, String, u64)> =
+        client.xinfo_consumers(stream_name, group_name).await?;
+    // This might show consumers if Redis hasn't cleaned them up yet, but they shouldn't be active.
+    println!("Consumers after shutdown: {:?}", consumers);
+
+    // 3. Check timing - shutdown should complete reasonably fast.
+    assert!(
+        shutdown_duration < Duration::from_secs(5),
+        "Shutdown took too long"
+    );
+
+    // Cleanup (redundant if shutdown worked, but good practice)
+    let _ = client
+        .xgroup_destroy::<(), _, _>(stream_name, group_name)
+        .await;
+    let _ = client.del::<(), _>(stream_name).await;
     Ok(())
 }

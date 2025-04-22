@@ -1,4 +1,12 @@
-use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    marker::PhantomData,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use fred::{
@@ -24,10 +32,14 @@ use crate::{
     errors::RmqResult,
     options::{QueueOptions, RetrySyncPolicy},
     prefetch::{ConsumerChannel, MessageBuffer},
+    scaling::{ScaleAction, ScalingContext, ScalingStrategy},
 };
 
 #[derive(Clone)]
-pub struct Queue<M> {
+pub struct Queue<M>
+where
+    M: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
+{
     client: Arc<Client>,
     stream: String,
     group: String,
@@ -36,8 +48,11 @@ pub struct Queue<M> {
     shutdown_tx: Sender<bool>,
     shutdown_rx: Receiver<bool>,
     tasks: Arc<DashMap<Uuid, TaskState<M>>>, // Store both handle and delivery
-    message_buffer: Option<Arc<MessageBuffer<M>>>, // Make this optional
+    message_buffer: Option<Arc<MessageBuffer<M>>>,
     prefetch_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    scaling_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    consumer_factory: Option<Arc<dyn Fn() -> Arc<dyn Consumer<Message = M>> + Send + Sync>>,
+    scaling_strategy: Option<Arc<dyn ScalingStrategy>>,
     queue_id: String, // Unique queue ID for all operations
     marker: PhantomData<M>,
 }
@@ -46,6 +61,7 @@ pub struct Queue<M> {
 struct TaskState<M> {
     handle: JoinHandle<()>,
     delivery: Option<Arc<Mutex<Option<Delivery<M>>>>>,
+    processing: Arc<AtomicBool>,
 }
 
 impl<M> Queue<M>
@@ -57,6 +73,8 @@ where
         stream: String,
         group: Option<String>,
         options: QueueOptions,
+        consumer_factory: Option<Arc<dyn Fn() -> Arc<dyn Consumer<Message = M>> + Send + Sync>>,
+        scaling_strategy: Option<Arc<dyn ScalingStrategy>>,
     ) -> RmqResult<Self> {
         let group = group.unwrap_or_else(|| "default_group".to_string());
 
@@ -91,6 +109,12 @@ where
 
         // Initialize MessageBuffer only if prefetching is enabled
         let message_buffer = if let Some(config) = &options.prefetch_config {
+            // Validate scaling config dependency
+            if config.scaling.is_some() && consumer_factory.is_none() {
+                return Err(crate::errors::RmqError::ConfigError(
+                    "Consumer factory must be provided when scaling is enabled".to_string(),
+                ));
+            }
             Some(Arc::new(MessageBuffer::new(config.buffer_size)))
         } else {
             None
@@ -111,6 +135,9 @@ where
             shutdown_rx,
             message_buffer, // Assign the Option<Arc<MessageBuffer>>
             prefetch_task: Arc::new(Mutex::new(None)),
+            scaling_task: Arc::new(Mutex::new(None)),
+            consumer_factory,
+            scaling_strategy,
             queue_id,
             marker: PhantomData,
         };
@@ -119,6 +146,17 @@ where
         if options.prefetch_config.is_some() {
             let prefetch_task = queue.start_prefetch_task().await;
             *queue.prefetch_task.lock().await = Some(prefetch_task);
+        }
+
+        // Start the scaling task if configured
+        if queue
+            .options
+            .prefetch_config
+            .as_ref()
+            .map_or(false, |pc| pc.scaling.is_some())
+        {
+            let scaling_task_handle = queue.start_scaling_task().await?;
+            *queue.scaling_task.lock().await = Some(scaling_task_handle);
         }
 
         Ok(queue)
@@ -152,6 +190,7 @@ where
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
+                        // Use debug! for regular logging
                         debug!("Prefetcher received shutdown signal. Exiting.");
 
                         break;
@@ -173,24 +212,25 @@ where
                         let current_len = message_buffer.get_overflow_size().await;
 
                         // Only fetch more if there's space for a meaningful number of messages
-                        // This is more aggressive than before and keeps the buffer fuller
                         if current_len >= effective_prefetch as usize {
-                            continue;
+                            // If we skipped fetching because the buffer is full,
+                            // try distributing existing overflow to potentially idle consumers.
+                            message_buffer.distribute_overflow().await;
+
+                            continue; // Continue to next loop iteration
                         }
 
                         // Calculate how many messages to fetch to fill the buffer
                         // Ensure subtraction doesn't underflow
                         let fetch_count = effective_prefetch.saturating_sub(current_len as u32);
 
-
-                        // Skip tiny fetches
-                        if fetch_count < 10 {
+                        // Ensure we only fetch if fetch_count is positive
+                        if fetch_count == 0 {
                             continue;
                         }
 
                         let pending_timeout = if !auto_recovery_done && options.auto_recovery.is_some() {
                             auto_recovery_done = true;
-
                             options.auto_recovery
                         } else {
                             options.pending_timeout
@@ -201,41 +241,32 @@ where
                             None => "nil".to_string(),
                         };
 
-                        debug!(
-                            "Prefetcher fetching {} messages for group '{}' with timeout {}",
-                            fetch_count,
-                            group,
-                            pending_timeout_arg
-                        );
-
                         let batch_size = fetch_count.to_string();
 
-                        // Fetch from Redis
+                        // Fetch from Redis using EVALSHA
                         let result: Result<Vec<(String, HashMap<String, Value>, u32)>, Error> = client
                             .evalsha::<Vec<(String, HashMap<String, Value>, u32)>, _, _, _>(
                                 &script_hash,
-                                &[&stream],
-                                &[&group, &prefetcher_id, &pending_timeout_arg, &batch_size],
+                                &[&stream], // KEYS[1] = stream name
+                                &[&group, &prefetcher_id, &pending_timeout_arg, &batch_size], // ARGV[1]=group, ARGV[2]=consumer, ARGV[3]=timeout, ARGV[4]=count
                             )
                             .await;
 
                         match result {
                             Ok(messages) => {
-                                debug!(
-                                    "Prefetcher fetched {} messages for group '{}'",
-                                    messages.len(),
-                                    group
-                                );
-
-                                // If we got close to our requested batch size, check if we need to immediately
-                                // fetch more to keep the buffer full (don't wait for next interval)
                                 let fetched_count = messages.len();
-                                message_buffer.push(messages).await;
 
-                                // If we got a significant number of messages and are close to our requested
-                                // batch size, immediately reset the interval to fetch more messages without waiting
-                                if fetched_count >= (fetch_count as usize * 3/4) && fetched_count > 50 {
-                                    interval.reset();
+                                // After pushing new messages, immediately try distributing any overflow
+                                message_buffer.distribute_overflow().await;
+
+                                if !messages.is_empty() {
+                                    message_buffer.push(messages).await;
+
+                                    // If we got close to our requested batch size, check if we need to immediately
+                                    // fetch more to keep the buffer full (don't wait for next interval)
+                                    if fetched_count >= (fetch_count as usize * 3/4) && fetched_count > 50 { // Check thresholds
+                                        interval.reset();
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -268,12 +299,192 @@ where
             stream.to_string(),
             group.map(|s| s.to_string()),
             options,
+            None,
+            None,
         )
         .await
     }
 
     pub fn client(&self) -> Arc<Client> {
         self.client.clone()
+    }
+
+    /// Returns the current number of registered consumer tasks.
+    pub fn consumer_count(&self) -> usize {
+        self.tasks.len()
+    }
+
+    // Add start_scaling_task method (implementation later)
+    async fn start_scaling_task(&self) -> RmqResult<JoinHandle<()>> {
+        // Ensure scaling is configured
+        let scaling_config = self
+            .options
+            .prefetch_config
+            .as_ref()
+            .and_then(|pc| pc.scaling.clone())
+            .ok_or_else(|| {
+                crate::errors::RmqError::ConfigError(
+                    "Attempted to start scaling task without scaling configuration".to_string(),
+                )
+            })?;
+
+        // Ensure necessary components are present
+        let strategy = self.scaling_strategy.clone().ok_or_else(|| {
+            crate::errors::RmqError::ConfigError(
+                "Scaling strategy missing for scaling task".to_string(),
+            )
+        })?;
+        let factory = self.consumer_factory.clone().ok_or_else(|| {
+            crate::errors::RmqError::ConfigError(
+                "Consumer factory missing for scaling task".to_string(),
+            )
+        })?;
+        let message_buffer = self.message_buffer.clone().ok_or_else(|| {
+            crate::errors::RmqError::ConfigError(
+                "Message buffer missing for scaling task".to_string(),
+            )
+        })?;
+        let tasks = self.tasks.clone();
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        let queue_clone = self.clone(); // Clone self for scale_up/scale_down calls
+
+        let handle = tokio::spawn(async move {
+            let mut interval = interval(Duration::from_millis(scaling_config.scale_interval));
+            debug!(
+                "Scaling task started. Interval: {}ms, Min: {}, Max: {}",
+                scaling_config.scale_interval,
+                scaling_config.min_consumers,
+                scaling_config.max_consumers
+            );
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        debug!("Scaling task received shutdown signal. Exiting.");
+
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        let current_consumers = tasks.len();
+                        // Calculate idle consumers more accurately
+                        let idle_consumers = tasks
+                            .iter()
+                            .filter(|entry| !entry.value().processing.load(Ordering::Relaxed))
+                            .count();
+                        let overflow_size = message_buffer.get_overflow_size().await;
+
+                        let context = ScalingContext {
+                            current_consumers,
+                            idle_consumers,
+                            overflow_size,
+                            min_consumers: scaling_config.min_consumers as usize,
+                            max_consumers: scaling_config.max_consumers as usize,
+                        };
+
+                        let action = strategy.decide(context).await;
+
+                        match action {
+                            ScaleAction::ScaleUp(count) => {
+                                let actual_count = std::cmp::min(
+                                    count,
+                                    scaling_config.max_consumers.saturating_sub(current_consumers as u32)
+                                );
+                                if actual_count > 0 {
+                                    debug!("Scaling up by {} consumers", actual_count);
+
+                                    if let Err(e) = queue_clone.scale_up(actual_count, &factory).await {
+                                        error!("Failed to scale up: {}", e);
+                                    }
+                                }
+                            }
+                            ScaleAction::ScaleDown(count) => {
+                                let actual_count = std::cmp::min(
+                                    count,
+                                    (current_consumers as u32).saturating_sub(scaling_config.min_consumers)
+                                );
+
+                                if actual_count > 0 {
+                                    debug!("Scaling down by {} consumers", actual_count);
+
+                                    if let Err(e) = queue_clone.scale_down(actual_count).await {
+                                        error!("Failed to scale down: {}", e);
+                                    }
+                                }
+                            }
+                            ScaleAction::Hold => {
+                                 debug!("Holding.");
+                            }
+                        }
+                    }
+                }
+            }
+
+            debug!("Scaling task completed.");
+        });
+
+        Ok(handle)
+    }
+
+    // Add scale_up method (implementation later)
+    async fn scale_up(
+        &self,
+        count: u32,
+        factory: &Arc<dyn Fn() -> Arc<dyn Consumer<Message = M>> + Send + Sync>,
+    ) -> RmqResult<()> {
+        debug!("Attempting to scale up by {} consumers", count);
+
+        for _ in 0..count {
+            let new_consumer = factory();
+            let id = Uuid::now_v7();
+
+            match self.start_consumer(new_consumer).await {
+                Ok(task_state) => {
+                    self.tasks.insert(id, task_state);
+                    debug!("Successfully added consumer {}", id);
+                }
+                Err(e) => {
+                    error!("Failed to start new consumer during scale up: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // Add scale_down method (implementation later)
+    async fn scale_down(&self, count: u32) -> RmqResult<()> {
+        debug!("Attempting to scale down by {} consumers", count);
+
+        let mut removed_count = 0;
+        let idle_keys: Vec<Uuid> = self
+            .tasks
+            .iter()
+            .filter(|entry| !entry.value().processing.load(Ordering::Relaxed))
+            .map(|entry| *entry.key())
+            .take(count as usize)
+            .collect();
+
+        for key in idle_keys {
+            if removed_count >= count {
+                break;
+            }
+
+            if let Some((_key, task_state)) = self.tasks.remove(&key) {
+                debug!("Aborting idle consumer task {}", key);
+                task_state.handle.abort();
+                // The consumer_task loop should handle unregistering from message_buffer on exit
+                removed_count += 1;
+            } else {
+                warn!(
+                    "Attempted to remove task {} during scale down, but it was already gone.",
+                    key
+                );
+            }
+        }
+
+        debug!("Successfully scaled down by {} consumers", removed_count);
+
+        Ok(())
     }
 
     pub async fn shutdown(&self, shutdown_timeout: Option<u64>) {
@@ -294,9 +505,7 @@ where
 
                     match timeout(prefetcher_timeout, handle).await {
                         Ok(_) => debug!("Prefetcher terminated within timeout."),
-                        Err(_) => {
-                            debug!("Prefetcher didn't terminate in time; aborting it.");
-                        }
+                        Err(_) => debug!("Prefetcher didn't terminate in time; aborting it."),
                     }
                 }
                 None => {
@@ -306,6 +515,13 @@ where
                     debug!("Prefetcher terminated gracefully.");
                 }
             }
+        }
+
+        // Wait for the scaling task
+        if let Some(handle) = self.scaling_task.lock().await.take() {
+            debug!("Waiting for scaling task to terminate...");
+            // Scaling task should shut down quickly, use short timeout like prefetcher
+            Self::wait_or_abort_task("Scaling task", handle, shutdown_timeout, Some(200)).await;
         }
 
         // Handle retry sync policy for OnShutdown
@@ -341,6 +557,34 @@ where
                 self.wait_tasks().await;
 
                 debug!("All consumer tasks terminated gracefully.");
+            }
+        }
+    }
+
+    // Helper for waiting/aborting tasks during shutdown
+    async fn wait_or_abort_task(
+        task_name: &str,
+        handle: JoinHandle<()>,
+        shutdown_timeout: Option<u64>,
+        specific_timeout_ms: Option<u64>,
+    ) {
+        let wait_duration = match specific_timeout_ms {
+            Some(ms) => Duration::from_millis(ms),
+            None => match shutdown_timeout {
+                Some(ms) => Duration::from_millis(ms),
+                None => Duration::from_secs(u64::MAX), // Effectively wait indefinitely
+            },
+        };
+
+        if wait_duration.as_secs() == u64::MAX {
+            // Wait indefinitely
+            let _ = handle.await;
+
+            debug!("{} terminated gracefully.", task_name);
+        } else {
+            match timeout(wait_duration, handle).await {
+                Ok(_) => debug!("{} terminated within timeout.", task_name),
+                Err(_) => debug!("{} didn't terminate in time; aborting it.", task_name),
             }
         }
     }
@@ -386,15 +630,9 @@ where
         let id = Uuid::now_v7();
 
         // Spawn the consumer task as a method on Queue
-        let (handle, delivery_holder) = self.start_consumer(Arc::new(consumer)).await?;
+        let task_state = self.start_consumer(Arc::new(consumer)).await?;
 
-        self.tasks.insert(
-            id,
-            TaskState {
-                handle,
-                delivery: delivery_holder,
-            },
-        );
+        self.tasks.insert(id, task_state);
 
         Ok(id)
     }
@@ -402,7 +640,7 @@ where
     async fn start_consumer(
         &self,
         consumer: Arc<dyn Consumer<Message = M>>,
-    ) -> RmqResult<(JoinHandle<()>, Option<Arc<Mutex<Option<Delivery<M>>>>>)> {
+    ) -> RmqResult<TaskState<M>> {
         let client = self.client.clone();
         let stream = self.stream.clone();
         let group = self.group.clone();
@@ -417,8 +655,7 @@ where
             None
         };
 
-        // Clone it to pass to the consumer task
-        let task_delivery_holder = delivery_holder.clone();
+        let delivery_holder_clone = delivery_holder.clone();
 
         // Generate a unique consumer task ID
         let consumer_id = Uuid::now_v7();
@@ -440,6 +677,9 @@ where
             None
         };
 
+        let processing = Arc::new(AtomicBool::new(false));
+        let processing_clone = processing.clone();
+
         let handle = tokio::spawn(async move {
             Self::consumer_task(
                 client,
@@ -452,13 +692,18 @@ where
                 script_hash,
                 shutdown_rx,
                 consumer_channel,
-                task_delivery_holder,
+                delivery_holder_clone,
+                processing_clone,
                 message_buffer,
             )
             .await;
         });
 
-        Ok((handle, delivery_holder))
+        Ok(TaskState {
+            handle,
+            delivery: delivery_holder,
+            processing,
+        })
     }
 
     // Produce a message to the queue (Redis Stream)
@@ -484,6 +729,7 @@ where
         mut shutdown_rx: Receiver<bool>,
         mut consumer_channel: Option<ConsumerChannel<M>>,
         delivery_holder: Option<Arc<Mutex<Option<Delivery<M>>>>>,
+        processing_status: Arc<AtomicBool>,
         message_buffer: Option<Arc<MessageBuffer<M>>>,
     ) {
         let mut auto_recovery_done = false;
@@ -559,6 +805,7 @@ where
                                     &options,
                                     shutdown_clone.clone(),
                                     delivery_holder.clone(),
+                                    processing_status.clone(),
                                 )
                                 .await;
                             }
@@ -600,6 +847,7 @@ where
         options: &QueueOptions,
         shutdown_rx: Receiver<bool>,
         delivery_holder: Option<Arc<Mutex<Option<Delivery<M>>>>>,
+        processing_status: Arc<AtomicBool>,
     ) {
         if *shutdown_rx.borrow() {
             debug!("Shutdown signal received before processing message {}, returning immediately without acking.", message_id);
@@ -607,151 +855,147 @@ where
             return; // Exit immediately, DO NOT ACK here
         }
 
-        if let Some(data) = fields.get("data") {
-            match serde_json::from_value::<M>(data.clone()) {
-                Ok(message) => {
-                    // Use queue_id for delivery
-                    let delivery = Delivery::new(
-                        client.clone(),
-                        stream.to_string(),
-                        group.to_string(),
-                        queue_id.clone(),
-                        message_id.clone(),
-                        message,
-                        options.max_retries(),
-                        delivery_count,
-                        options.delete_on_ack,
-                        options.retry_sync.clone(),
-                    );
+        let data = match fields.get("data") {
+            Some(value) => value,
+            None => {
+                error!("Message {} missing 'data' field", message_id);
+                // Acknowledge the message to remove it from the pending list
+                let _ = client.xack::<(), _, _, _>(stream, group, &message_id).await;
 
-                    // If this is a manual queue (no pending_timeout), start keep-alive
-                    if options.pending_timeout.is_none() {
-                        delivery.start_keep_alive(options.poll_interval()).await;
+                return;
+            }
+        };
+
+        let message = match serde_json::from_value::<M>(data.clone()) {
+            Ok(m) => m,
+            Err(e) => {
+                error!("Failed to deserialize message {}: {}", message_id, e);
+                // Acknowledge the message to remove it from the pending list
+                let _ = client.xack::<(), _, _, _>(stream, group, &message_id).await;
+
+                return;
+            }
+        };
+
+        // Use queue_id for delivery
+        let delivery = Delivery::new(
+            client.clone(),
+            stream.to_string(),
+            group.to_string(),
+            queue_id.clone(),
+            message_id.clone(),
+            message,
+            options.max_retries(),
+            delivery_count,
+            options.delete_on_ack,
+            options.retry_sync.clone(),
+        );
+
+        // If this is a manual queue (no pending_timeout), start keep-alive
+        if options.pending_timeout.is_none() {
+            delivery.start_keep_alive(options.poll_interval()).await;
+        }
+
+        // When processing a message, store the delivery in the holder if needed
+        if let Some(holder) = &delivery_holder {
+            let mut lock = holder.lock().await;
+            *lock = Some(delivery.clone());
+        }
+
+        // Set processing status to true
+        processing_status.store(true, Ordering::Relaxed);
+
+        loop {
+            let result = consumer.process(&delivery).await;
+
+            match result {
+                Ok(_) => {
+                    // Succeeded, ack and break out
+                    if let Err(e) = delivery.ack().await {
+                        error!("Error acknowledging message {}: {}", message_id, e);
                     }
 
-                    // When processing a message, store the delivery in the holder if needed
-                    if let Some(holder) = &delivery_holder {
-                        let mut lock = holder.lock().await;
-                        *lock = Some(delivery.clone());
-                    }
-
-                    loop {
-                        let result = consumer.process(&delivery).await;
-
-                        match result {
-                            Ok(_) => {
-                                // Succeeded, ack and break out
-                                if let Err(e) = delivery.ack().await {
-                                    error!("Error acknowledging message {}: {}", message_id, e);
-                                }
-
-                                break;
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Error processing message {}: {}",
-                                    message_id,
-                                    e.to_string()
-                                );
-
-                                // Check for shutdown signal before retry
-                                if *shutdown_rx.borrow() {
-                                    debug!("Shutdown signal received before retry check for message {}, skipping retry.", message_id);
-
-                                    return; // Exit immediately, DO NOT RETRY or set_error
-                                }
-
-                                delivery.set_error(e.clone()).await;
-
-                                // Add this line to determine if we should retry
-                                let should_retry = consumer.should_retry(&delivery).await;
-
-                                if should_retry {
-                                    // Check if this is a manual queue scenario
-                                    if options.pending_timeout.is_none() {
-                                        // Increase delivery_count after a failed attempt only for manual queue
-                                        if let Err(e) = delivery.inc_delivery_count().await {
-                                            error!(
-                                                "Error incrementing delivery count for message {}: {}",
-                                                message_id, e
-                                            );
-                                        }
-                                        // Sleep if retry_delay is specified in retry_config
-                                        if options.retry_delay() > 0 {
-                                            sleep(Duration::from_millis(options.retry_delay()))
-                                                .await;
-                                        }
-
-                                        // Loop again to retry processing
-                                        continue;
-                                    } else {
-                                        // Stealing queue scenario:
-                                        // We rely on `pending_timeout` & XAUTOCLAIM to retry eventually
-                                        // Do not ack, just break. The message remains pending.
-                                        break;
-                                    }
-                                } else {
-                                    // should_retry = false
-                                    if let Some(dlq_name) = options.dlq_name.clone() {
-                                        // Move the message to the Dead-Letter Queue
-                                        if let Err(e) = client
-                                            .xadd::<String, _, _, _, _>(
-                                                &dlq_name,
-                                                false,
-                                                None,
-                                                "*", // Let Redis generate a new ID
-                                                vec![
-                                                    ("data", data.to_string()),
-                                                    ("error", e.to_string()),
-                                                ],
-                                            )
-                                            .await
-                                        {
-                                            error!(
-                                                "Error moving message {} to DLQ: {}",
-                                                message_id, e
-                                            );
-                                        }
-
-                                        // Acknowledge the original message to remove it from pending
-                                        if let Err(e) = delivery.ack().await {
-                                            error!(
-                                                "Error acknowledging message {}: {}",
-                                                message_id, e
-                                            );
-                                        }
-                                    } else {
-                                        // Without DLQ: Acknowledge the message to remove it from pending
-                                        if let Err(e) = delivery.ack().await {
-                                            error!(
-                                                "Error acknowledging message {}: {}",
-                                                message_id, e
-                                            );
-                                        }
-                                    }
-
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // When message processing is done, clear the delivery
-                    if let Some(holder) = &delivery_holder {
-                        let mut lock = holder.lock().await;
-                        *lock = None;
-                    }
+                    break;
                 }
                 Err(e) => {
-                    error!("Failed to deserialize message {}: {}", message_id, e);
-                    // Acknowledge the message to remove it from the pending list
-                    let _ = client.xack::<(), _, _, _>(stream, group, &message_id).await;
+                    error!("Error processing message {}: {}", message_id, e.to_string());
+
+                    // Check for shutdown signal before retry
+                    if *shutdown_rx.borrow() {
+                        debug!("Shutdown signal received before retry check for message {}, skipping retry.", message_id);
+
+                        return; // Exit immediately, DO NOT RETRY or set_error
+                    }
+
+                    delivery.set_error(e.clone()).await;
+
+                    // Add this line to determine if we should retry
+                    let should_retry = consumer.should_retry(&delivery).await;
+
+                    if should_retry {
+                        // Check if this is a manual queue scenario
+                        if options.pending_timeout.is_none() {
+                            // Increase delivery_count after a failed attempt only for manual queue
+                            if let Err(e) = delivery.inc_delivery_count().await {
+                                error!(
+                                    "Error incrementing delivery count for message {}: {}",
+                                    message_id, e
+                                );
+                            }
+                            // Sleep if retry_delay is specified in retry_config
+                            if options.retry_delay() > 0 {
+                                sleep(Duration::from_millis(options.retry_delay())).await;
+                            }
+
+                            // Loop again to retry processing
+                            continue;
+                        } else {
+                            // Stealing queue scenario:
+                            // We rely on `pending_timeout` & XAUTOCLAIM to retry eventually
+                            // Do not ack, just break. The message remains pending.
+                            break;
+                        }
+                    } else {
+                        // should_retry = false
+                        if let Some(dlq_name) = options.dlq_name.clone() {
+                            // Move the message to the Dead-Letter Queue
+                            if let Err(e) = client
+                                .xadd::<String, _, _, _, _>(
+                                    &dlq_name,
+                                    false,
+                                    None,
+                                    "*", // Let Redis generate a new ID
+                                    vec![("data", data.to_string()), ("error", e.to_string())],
+                                )
+                                .await
+                            {
+                                error!("Error moving message {} to DLQ: {}", message_id, e);
+                            }
+
+                            // Acknowledge the original message to remove it from pending
+                            if let Err(e) = delivery.ack().await {
+                                error!("Error acknowledging message {}: {}", message_id, e);
+                            }
+                        } else {
+                            // Without DLQ: Acknowledge the message to remove it from pending
+                            if let Err(e) = delivery.ack().await {
+                                error!("Error acknowledging message {}: {}", message_id, e);
+                            }
+                        }
+
+                        break;
+                    }
                 }
             }
-        } else {
-            error!("Message {} missing 'data' field", message_id);
-            // Acknowledge the message to remove it from the pending list
-            let _ = client.xack::<(), _, _, _>(stream, group, &message_id).await;
         }
+
+        // When message processing is done, clear the delivery
+        if let Some(holder) = &delivery_holder {
+            let mut lock = holder.lock().await;
+            *lock = None;
+        }
+
+        // Reset processing status
+        processing_status.store(false, Ordering::Relaxed);
     }
 }

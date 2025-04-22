@@ -11,9 +11,17 @@ pub struct RetryConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct ScalingConfig {
+    pub min_consumers: u32,
+    pub max_consumers: u32,
+    pub scale_interval: u64, // Milliseconds between scaling checks
+}
+
+#[derive(Clone, Debug)]
 pub struct PrefetchConfig {
     pub count: u32,
     pub buffer_size: usize,
+    pub scaling: Option<ScalingConfig>, // Optional scaling configuration
 }
 
 #[derive(Clone)]
@@ -48,6 +56,7 @@ impl Default for QueueOptions {
                 // Enable prefetching by default
                 count: 100,      // Default prefetch count
                 buffer_size: 50, // Default consumer buffer size
+                scaling: None,   // No scaling by default
             }),
             retry_sync: RetrySyncPolicy::OnEachRetry, // Keep current behavior as default
         }

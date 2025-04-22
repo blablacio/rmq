@@ -1,19 +1,27 @@
 use fred::prelude::{Client, ClientLike, Config};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{marker::PhantomData, sync::Arc};
+use tracing::warn;
 
 use crate::{
+    consumer::Consumer,
     errors::{RmqError, RmqResult},
-    options::PrefetchConfig,
+    options::{PrefetchConfig, ScalingConfig},
+    scaling::{DefaultScalingStrategy, ScalingStrategy},
     Queue, QueueOptions, RetryConfig, RetrySyncPolicy,
 };
 
-pub struct QueueBuilder<M> {
+pub struct QueueBuilder<M>
+where
+    M: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
+{
     url: Option<String>,
     client: Option<Arc<Client>>,
     stream: Option<String>,
     group: Option<String>,
     options: QueueOptions,
+    factory: Option<Arc<dyn Fn() -> Arc<dyn Consumer<Message = M>> + Send + Sync>>,
+    scaling_strategy: Option<Arc<dyn ScalingStrategy>>,
     marker: PhantomData<M>,
 }
 
@@ -28,6 +36,8 @@ where
             stream: None,
             group: None,
             options: QueueOptions::default(),
+            factory: None,
+            scaling_strategy: None,
             marker: PhantomData,
         }
     }
@@ -107,7 +117,11 @@ where
             QueueOptions::default().prefetch_config.unwrap().buffer_size, // Use default buffer size if not set
             |config| config.buffer_size,
         );
-        self.options.prefetch_config = Some(PrefetchConfig { count, buffer_size });
+        self.options.prefetch_config = Some(PrefetchConfig {
+            count,
+            buffer_size,
+            scaling: None,
+        });
 
         self
     }
@@ -122,7 +136,97 @@ where
             QueueOptions::default().prefetch_config.unwrap().count, // Use default count if not set
             |config| config.count,
         );
-        self.options.prefetch_config = Some(PrefetchConfig { count, buffer_size });
+        self.options.prefetch_config = Some(PrefetchConfig {
+            count,
+            buffer_size,
+            scaling: None,
+        });
+
+        self
+    }
+
+    /// Enable and configure auto-scaling.
+    ///
+    /// Requires prefetching to be enabled.
+    /// Requires a `consumer_factory` to be set.
+    pub fn scaling_config(
+        mut self,
+        min_consumers: u32,
+        max_consumers: u32,
+        scale_interval: u64,
+    ) -> Self {
+        let mut config = self
+            .options
+            .prefetch_config
+            .unwrap_or_else(|| QueueOptions::default().prefetch_config.unwrap());
+
+        config.scaling = Some(ScalingConfig {
+            min_consumers,
+            max_consumers,
+            scale_interval,
+        });
+        self.options.prefetch_config = Some(config);
+
+        self
+    }
+
+    /// Provide a factory function to create new consumer instances for auto-scaling.
+    ///
+    /// This is required if auto-scaling is enabled.
+    /// The factory itself should be wrapped in an Arc.
+    pub fn with_factory<F, C>(mut self, factory: F) -> Self
+    where
+        // F is a closure that returns a concrete Consumer type C
+        F: Fn() -> C + Send + Sync + 'static,
+        // C is the concrete Consumer type
+        C: Consumer<Message = M> + Send + Sync + 'static,
+    {
+        if self.factory.is_some() {
+            warn!("with_factory called multiple times. Overwriting previous factory.");
+        }
+
+        // Create a new closure that calls the user's closure and wraps the result
+        let wrapped_factory = Arc::new(move || {
+            let consumer_instance: C = factory();
+            // Wrap the concrete instance in Arc and cast to Arc<dyn Consumer<...>>
+            Arc::new(consumer_instance) as Arc<dyn Consumer<Message = M>>
+        });
+
+        self.factory = Some(wrapped_factory);
+
+        self
+    }
+
+    /// Sets a template consumer instance to be cloned for creating new consumers during auto-scaling.
+    ///
+    /// The provided instance must implement `Clone`.
+    pub fn with_instance<C>(mut self, instance: C) -> Self
+    where
+        C: Consumer<Message = M> + Clone + Send + Sync + 'static,
+    {
+        if self.factory.is_some() {
+            warn!("with_instance called after with_factory or multiple times. Overwriting previous factory.");
+        }
+
+        // Create a factory closure that clones the provided instance
+        let factory = Arc::new(move || {
+            // Clone the captured instance each time the factory is called
+            let cloned_instance = instance.clone();
+            // Wrap the cloned instance in Arc and cast to the trait object
+            Arc::new(cloned_instance) as Arc<dyn Consumer<Message = M>>
+        });
+
+        // Store the cloning factory closure
+        self.factory = Some(factory);
+
+        self
+    }
+
+    /// Provide a custom scaling strategy.
+    ///
+    /// If not provided and scaling is enabled, `DefaultScalingStrategy` will be used.
+    pub fn scaling_strategy(mut self, strategy: impl ScalingStrategy + 'static) -> Self {
+        self.scaling_strategy = Some(Arc::new(strategy));
 
         self
     }
@@ -142,6 +246,32 @@ where
         let group = self.group;
         let options = self.options;
 
+        // Validate scaling configuration
+        let (consumer_factory, scaling_strategy) =
+            if let Some(prefetch_config) = &options.prefetch_config {
+                if prefetch_config.scaling.is_some() {
+                    // Scaling enabled, factory is required
+                    let factory = self.factory.ok_or_else(|| {
+                        RmqError::ConfigError(
+                            "Consumer factory must be provided when scaling is enabled".to_string(),
+                        )
+                    })?;
+
+                    // Use default strategy if none provided
+                    let strategy = self
+                        .scaling_strategy
+                        .unwrap_or_else(|| Arc::new(DefaultScalingStrategy));
+
+                    (Some(factory), Some(strategy))
+                } else {
+                    // Scaling disabled
+                    (None, None)
+                }
+            } else {
+                // Prefetch disabled (implies scaling disabled)
+                (None, None)
+            };
+
         let client = match self.client {
             Some(c) => c,
             None => {
@@ -157,6 +287,15 @@ where
             }
         };
 
-        Queue::new(client, stream, group, options).await
+        // Pass validated factory and strategy to Queue::new
+        Queue::new(
+            client,
+            stream,
+            group,
+            options,
+            consumer_factory,
+            scaling_strategy,
+        )
+        .await
     }
 }

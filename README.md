@@ -22,6 +22,12 @@
 - **Clonable Queues & Deliveries**
   Both `Queue` and `Delivery` structs can be freely cloned and passed around, enabling flexible concurrency patterns and easier integration with async workflows.
 
+- **Message Prefetching**
+  Efficient message prefetching reduces Redis calls and CPU usage, especially with many consumers.
+
+- **Auto-Scaling**
+  Dynamically adjust the number of consumers based on workload to optimize resource usage and throughput.
+
 - **Integration-Ready**
   Easily run integration tests against a local or containerized Redis instance for reliable testing in CI/CD pipelines.
 
@@ -93,7 +99,14 @@ async fn main() -> Result<()> {
 
     // Build a queue from the client
     let options = QueueOptions::default();
-    let queue = Queue::new(Arc::new(client), "my_stream".to_string(), Some("my_group".to_string()), options).await?;
+    let queue = Queue::new(
+        Arc::new(client),
+        "my_stream".to_string(),
+        Some("my_group".to_string()),
+        options,
+        None, // consumer_factory
+        None, // scaling_strategy
+    ).await?;
 
     // Register consumer
     queue.register_consumer(MyConsumer).await?;
@@ -187,7 +200,7 @@ async fn main() -> Result<()> {
 }
 ```
 
-**Or** if you’d rather not create a `fred::Client` yourself, you can rely purely on the builder’s Redis URL:
+**Or** if you'd rather not create a `fred::Client` yourself, you can rely purely on the builder's Redis URL:
 
 ```rust
 #[tokio::main]
@@ -298,8 +311,8 @@ Setting `delete_on_ack: true` in `QueueOptions` will automatically delete messag
 
 ### Manual vs. Stealing Queues
 
-If `pending_timeout` is `None`, the queue is a **manual queue** (messages won’t be reclaimed automatically). The consumer must **ack** or **retry** in-process.
-If `pending_timeout` is `Some(...)`, it’s a **stealing queue**—Redis Streams will auto-claim messages that a consumer has taken too long to acknowledge.
+If `pending_timeout` is `None`, the queue is a **manual queue** (messages won't be reclaimed automatically). The consumer must **ack** or **retry** in-process.
+If `pending_timeout` is `Some(...)`, it's a **stealing queue**—Redis Streams will auto-claim messages that a consumer has taken too long to acknowledge.
 
 ### Prefetching
 
@@ -319,6 +332,7 @@ let options = QueueOptions {
     prefetch_config: Some(PrefetchConfig {
         count: 100,      // Prefetch up to 100 messages at once
         buffer_size: 50, // Buffer up to 50 messages per consumer channel
+        scaling: None,   // No auto-scaling (default)
     }),
     ..Default::default()
 };
@@ -355,6 +369,135 @@ let queue = QueueBuilder::<String>::new()
 
 Prefetching is particularly beneficial when you have many consumers (>10) or need to minimize CPU usage in systems with sporadic message activity.
 
+### Auto-Scaling
+
+**rmq** provides an automatic consumer scaling system that dynamically adjusts the number of active consumers based on workload:
+
+- Scale up when message backlog builds and no idle consumers are available
+- Scale down when consumers are idle and no backlog exists
+- Respect minimum and maximum consumer bounds
+- Use custom scaling strategies for specific workload patterns
+
+Auto-scaling requires prefetching to be enabled and works best with cloneable consumers or a consumer factory.
+
+#### Enabling Auto-Scaling
+
+Using the builder pattern:
+
+```rust
+use rmq::{QueueBuilder, Consumer};
+use async_trait::async_trait;
+use std::sync::Arc;
+
+// Define a consumer that can be cloned for auto-scaling
+#[derive(Clone)]
+struct MyScalableConsumer;
+
+#[async_trait]
+impl Consumer for MyScalableConsumer {
+    type Message = String;
+
+    async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<()> {
+        // Process the message
+        delivery.ack().await?;
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let queue = QueueBuilder::<String>::new()
+        .url("redis://127.0.0.1:6379")
+        .stream("scaling_stream")
+        .group("scaling_group")
+        // Configure prefetching (required for scaling)
+        .prefetch_count(10)
+        .buffer_size(5)
+        // Configure auto-scaling
+        .scaling_config(
+            2,      // min_consumers
+            10,     // max_consumers
+            1000,   // scale_interval_ms
+        )
+        // Provide a consumer instance that can be cloned
+        .with_instance(MyScalableConsumer)
+        .build()
+        .await?;
+
+    // Auto-scaling is now enabled - no need to manually register consumers
+
+    // Produce messages
+    for i in 0..100 {
+        queue.produce(&format!("Message {}", i)).await?;
+    }
+
+    // The queue will automatically scale between 2-10 consumers based on load
+
+    queue.shutdown(Some(5000)).await;
+    Ok(())
+}
+```
+
+#### Alternative: Factory Function
+
+Instead of providing a cloneable consumer instance, you can provide a factory function:
+
+```rust
+let queue = QueueBuilder::<String>::new()
+    // ...other configuration...
+    .scaling_config(2, 10, 1000)
+    .with_factory(|| {
+        // Create and return a new consumer instance
+        MyConsumer::new()
+    })
+    .build()
+    .await?;
+```
+
+#### Custom Scaling Strategies
+
+You can implement the `ScalingStrategy` trait to customize how scaling decisions are made:
+
+```rust
+use rmq::{ScalingStrategy, ScalingContext, ScaleAction};
+use async_trait::async_trait;
+
+struct MyCustomStrategy;
+
+#[async_trait]
+impl ScalingStrategy for MyCustomStrategy {
+    async fn decide(&self, context: ScalingContext) -> ScaleAction {
+        // Implement your custom scaling logic
+        if context.overflow_size > context.current_consumers * 10 {
+            // Scale up faster if backlog is large
+            let scale_up = (context.max_consumers - context.current_consumers).min(3);
+            ScaleAction::ScaleUp(scale_up as u32)
+        } else if context.idle_consumers > context.current_consumers / 2 {
+            // Scale down more aggressively if more than half consumers are idle
+            let scale_down = context.idle_consumers.min(context.current_consumers - context.min_consumers);
+            ScaleAction::ScaleDown(scale_down as u32)
+        } else {
+            ScaleAction::Hold
+        }
+    }
+}
+
+// Use with the builder
+let queue = QueueBuilder::<String>::new()
+    // ...other configuration...
+    .scaling_config(2, 10, 1000)
+    .with_instance(MyScalableConsumer)
+    .scaling_strategy(MyCustomStrategy)
+    .build()
+    .await?;
+```
+
+#### Auto-Scaling Benefits
+
+- **Resource Efficiency**: Only use as many consumers as needed
+- **Automatic Load Handling**: Adapt to varying message rates
+- **Simplified Operations**: No need to manually tune consumer counts
+
 ---
 
 ## Testing
@@ -387,12 +530,16 @@ _(As long as you have a local Redis instance accessible via `REDIS_URL` or the d
   Set up pending timeout, poll interval, and optional `RetryConfig`.
 - **`Consumer`**
   Implement custom logic in `process()` and optionally override `should_retry()` to control message handling.
+- **`PrefetchConfig`**
+  Configure message prefetching and optional auto-scaling.
+- **`ScalingStrategy`**
+  Implement custom scaling logic by implementing this trait.
 
 ---
 
 ## Contributing
 
-Contributions are welcome! Please open an issue or submit a pull request at [GitHub](https://github.com/blablacio/rmq.git). We’d love to see your ideas on advanced features, improved scheduling, or broader use cases.
+Contributions are welcome! Please open an issue or submit a pull request at [GitHub](https://github.com/blablacio/rmq.git). We'd love to see your ideas on advanced features, improved scheduling, or broader use cases.
 
 ---
 
