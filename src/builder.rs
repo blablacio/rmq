@@ -68,8 +68,44 @@ where
         self
     }
 
+    /// Sets queue options, merging with any already configured settings.
+    ///
+    /// This is a convenience method for bulk configuration. Settings already
+    /// configured via specific builder methods (like `prefetch_count()`,
+    /// `auto_recovery()`, etc.) will be preserved and take precedence.
+    ///
+    /// For more fine-grained control, use the individual setter methods instead.
     pub fn options(mut self, options: QueueOptions) -> Self {
-        self.options = options;
+        // Save existing settings that might have been set via builder methods
+        let existing = self.options;
+
+        // Update with provided options, but preserve any explicitly set values
+        self.options = QueueOptions {
+            // For simple Option<T> fields, use existing value if it's Some, otherwise use new value
+            pending_timeout: existing.pending_timeout.or(options.pending_timeout),
+            poll_interval: existing.poll_interval.or(options.poll_interval),
+            retry_config: existing.retry_config.or(options.retry_config),
+            dlq_name: existing.dlq_name.or(options.dlq_name),
+            auto_recovery: existing.auto_recovery.or(options.auto_recovery),
+
+            // For prefetch_config, more complex merging might be needed
+            prefetch_config: match (existing.prefetch_config, options.prefetch_config) {
+                // If existing has value, preserve it (builder methods took precedence)
+                (Some(config), _) => Some(config),
+                // Otherwise use the new value
+                (None, new_config) => new_config,
+            },
+
+            // For non-Option fields, prefer existing value if it was explicitly changed from default
+            retry_sync: if existing.retry_sync != QueueOptions::default().retry_sync {
+                existing.retry_sync
+            } else {
+                options.retry_sync
+            },
+
+            // Add other fields as needed
+            ..options
+        };
 
         self
     }
@@ -234,6 +270,25 @@ where
     /// Convenience: set the retry sync policy.
     pub fn retry_sync(mut self, policy: RetrySyncPolicy) -> Self {
         self.options.retry_sync = policy;
+
+        self
+    }
+
+    /// Set auto-recovery timeout in milliseconds.
+    pub fn auto_recovery(mut self, timeout_ms: u64) -> Self {
+        self.options.auto_recovery = Some(timeout_ms);
+
+        self
+    }
+
+    /// Enable/disable auto-recovery.
+    pub fn with_auto_recovery(mut self, enabled: bool) -> Self {
+        if enabled {
+            // Use default value if enabling without specific timeout
+            self.options.auto_recovery = Some(5000); // Default value
+        } else {
+            self.options.auto_recovery = None;
+        }
 
         self
     }
