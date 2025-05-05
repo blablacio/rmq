@@ -3797,8 +3797,9 @@ async fn test_auto_scaling_shutdown() -> eyre::Result<()> {
     // A better check might be needed depending on exact shutdown guarantees.
 
     // 2. Check Redis state (optional but good) - group might still exist, but no consumers.
-    let consumers: Vec<(String, String, String, u64, String, u64)> =
-        client.xinfo_consumers(stream_name, group_name).await?;
+    let consumers = client
+        .xinfo_consumers::<(), _, _>(stream_name, group_name)
+        .await?;
     // This might show consumers if Redis hasn't cleaned them up yet, but they shouldn't be active.
     println!("Consumers after shutdown: {:?}", consumers);
 
