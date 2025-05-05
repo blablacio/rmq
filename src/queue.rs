@@ -660,12 +660,18 @@ where
         // Generate a unique consumer task ID
         let consumer_id = Uuid::now_v7();
 
-        // Use the queue's ID for Redis operations
-        let queue_id = self.queue_id.clone();
+        let queue_id = self.queue_id.clone(); // Use the queue's ID for Redis operations
+        let processing = Arc::new(AtomicBool::new(false));
+        let processing_clone = processing.clone();
 
         // Register with prefetch system only if prefetch_config is Some
         let consumer_channel = if let Some(buffer) = &self.message_buffer {
-            Some(buffer.register_consumer(consumer_id).await)
+            // Pass the processing flag along with the ID
+            Some(
+                buffer
+                    .register_consumer(consumer_id, processing.clone())
+                    .await,
+            ) // Pass processing_clone here
         } else {
             None
         };
@@ -676,9 +682,6 @@ where
         } else {
             None
         };
-
-        let processing = Arc::new(AtomicBool::new(false));
-        let processing_clone = processing.clone();
 
         let handle = tokio::spawn(async move {
             Self::consumer_task(

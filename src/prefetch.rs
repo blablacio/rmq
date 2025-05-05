@@ -3,12 +3,20 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
     marker::PhantomData,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
 type Message = (String, HashMap<String, Value>, u32); // Message ID, fields, retry count
+
+struct ConsumerState {
+    sender: mpsc::Sender<Message>,
+    processing: Arc<AtomicBool>,
+}
 
 pub struct ConsumerChannel<M> {
     receiver: mpsc::Receiver<Message>,
@@ -30,8 +38,8 @@ impl<M> ConsumerChannel<M> {
 
 // Simple, direct implementation with minimal overhead
 pub struct MessageBuffer<M> {
-    // Use DashMap for concurrent consumer management
-    consumers: Arc<DashMap<Uuid, mpsc::Sender<Message>>>,
+    // Store both sender and processing flag
+    consumers: Arc<DashMap<Uuid, ConsumerState>>,
     // Overflow buffer - protected by Mutex for exclusive access
     overflow: Arc<Mutex<VecDeque<Message>>>,
     // Channel capacity per consumer
@@ -54,14 +62,22 @@ impl<M> MessageBuffer<M> {
         self.overflow.lock().await.len()
     }
 
-    pub async fn register_consumer(&self, consumer_id: Uuid) -> ConsumerChannel<M> {
+    pub async fn register_consumer(
+        &self,
+        consumer_id: Uuid,
+        processing: Arc<AtomicBool>, // Add processing flag parameter
+    ) -> ConsumerChannel<M> {
         // Create channel with appropriate capacity
         let (sender, receiver) = mpsc::channel(self.consumer_capacity);
 
-        // Insert directly into DashMap (no write lock needed)
-        self.consumers.insert(consumer_id, sender);
+        // Store the sender and the processing flag
+        let state = ConsumerState {
+            sender,
+            processing, // Store the passed flag
+        };
+        self.consumers.insert(consumer_id, state);
 
-        // Check if there are messages in overflow that can be sent to this consumer
+        // Check if there are messages in overflow that can be sent to this new consumer
         self.distribute_overflow().await;
 
         // Return the consumer channel
@@ -83,107 +99,124 @@ impl<M> MessageBuffer<M> {
             return;
         }
 
-        // Check consumer count directly
-        let consumer_count = self.consumers.len();
-
-        if consumer_count == 0 {
-            // No consumers, store all in overflow
+        if self.consumers.is_empty() {
             let mut overflow = self.overflow.lock().await;
             overflow.extend(messages);
 
             return;
         }
 
-        // Collect senders to avoid holding iterator during sends
-        let consumer_senders: Vec<mpsc::Sender<Message>> = self
-            .consumers
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect();
+        // Create a single list prioritizing idle consumers
+        // Cloning Arc<AtomicBool> and mpsc::Sender is cheap
+        let mut prioritized_consumers = Vec::new();
+        let mut busy_consumers_temp = Vec::new(); // Temp storage for busy ones
 
-        // Single overflow lock acquisition - only once if needed
-        let mut overflow_msgs = Vec::new();
+        for entry in self.consumers.iter() {
+            let state = entry.value();
 
-        // Distribute messages round-robin using the collected senders
-        for (i, message) in messages.into_iter().enumerate() {
-            // Ensure we don't panic if consumer_senders became empty unexpectedly
-            if consumer_senders.is_empty() {
-                overflow_msgs.push(message);
-
-                continue;
-            }
-
-            let sender = &consumer_senders[i % consumer_senders.len()]; // Use len() of collected vec
-
-            // Non-blocking send - collect failures for batch overflow processing
-            if let Err(e) = sender.try_send(message) {
-                // Push the message to overflow regardless of Full or Closed error
-                let msg = e.into_inner();
-                overflow_msgs.push(msg);
+            if !state.processing.load(Ordering::Relaxed) {
+                prioritized_consumers.push(state.sender.clone()); // Idle go first
+            } else {
+                busy_consumers_temp.push(state.sender.clone()); // Busy collected separately
             }
         }
 
-        // Only acquire overflow lock once if needed
+        prioritized_consumers.extend(busy_consumers_temp); // Append busy consumers
+
+        // If no consumers ended up in the list (e.g., map is empty after check)
+        if prioritized_consumers.is_empty() {
+            let mut overflow = self.overflow.lock().await;
+            overflow.extend(messages);
+
+            return;
+        }
+
+        let mut overflow_msgs = VecDeque::new();
+
+        'message_loop: for message in messages {
+            // Try sending to the first available consumer in the prioritized list
+            for sender in &prioritized_consumers {
+                // Use try_send directly. If it succeeds, the message is sent.
+                if sender.try_send(message.clone()).is_ok() {
+                    // Clone message for the attempt
+                    continue 'message_loop; // Sent successfully, move to the next message
+                }
+                // If try_send fails (Err), continue to the next consumer in the list
+            }
+
+            // If the loop completes without sending, add to overflow
+            overflow_msgs.push_back(message);
+        }
+
+        // Add any overflowed messages to the main overflow queue
         if !overflow_msgs.is_empty() {
             let mut overflow = self.overflow.lock().await;
             overflow.extend(overflow_msgs);
         }
 
-        // Attempt to distribute any messages currently in overflow AFTER pushing new ones.
+        // Attempt to distribute any messages currently in overflow
         self.distribute_overflow().await;
     }
 
     pub async fn distribute_overflow(&self) {
         let mut overflow_guard = self.overflow.lock().await;
-        let initial_size = overflow_guard.len();
 
-        if initial_size == 0 {
-            return; // Release lock implicitly
+        if overflow_guard.is_empty() {
+            return; // Nothing to distribute
         }
 
-        let consumer_count = self.consumers.len();
+        // Create prioritized consumer list (idle first)
+        let mut prioritized_consumers = Vec::new();
+        let mut busy_consumers_temp = Vec::new();
 
-        if consumer_count == 0 {
-            return; // Release lock implicitly
+        for entry in self.consumers.iter() {
+            let state = entry.value();
+
+            if !state.processing.load(Ordering::Relaxed) {
+                prioritized_consumers.push(state.sender.clone());
+            } else {
+                busy_consumers_temp.push(state.sender.clone());
+            }
         }
 
-        // Create a temporary list of consumer senders to iterate over without holding the DashMap lock
-        let senders: Vec<_> = self
-            .consumers
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect();
+        prioritized_consumers.extend(busy_consumers_temp);
 
-        // Iterate while there are messages and we haven't tried all consumers in this pass
-        let mut consumer_idx = 0;
-        let mut attempts = 0; // Track attempts to avoid infinite loops if all channels are full
+        // No consumers available to distribute to
+        if prioritized_consumers.is_empty() {
+            return;
+        }
 
-        // Loop while there are messages AND we haven't fruitlessly tried every consumer
-        while !overflow_guard.is_empty() && attempts < senders.len() {
-            let current_sender_idx = consumer_idx % senders.len(); // Ensure index wraps around
-            let sender = &senders[current_sender_idx];
+        let initial_len = overflow_guard.len();
+        let mut processed_count = 0;
 
-            // Peek at the front message without removing it yet
+        // Iterate through the overflow queue once
+        while processed_count < initial_len && !overflow_guard.is_empty() {
+            processed_count += 1;
+
             if let Some(message) = overflow_guard.front() {
-                // Attempt to send the message
-                if sender.try_send(message.clone()).is_ok() {
-                    // Success! Remove the message from the front of the queue
-                    overflow_guard.pop_front();
-                    // Move to the next consumer index for the *next* message
-                    consumer_idx = (consumer_idx + 1) % senders.len(); // Maintain round-robin
-                    attempts = 0; // Reset attempts since we successfully sent one
+                let mut sent = false;
 
-                    // Continue to the next message in the overflow buffer
-                    continue;
+                // Try sending to the first available prioritized consumer
+                for sender in &prioritized_consumers {
+                    if sender.try_send(message.clone()).is_ok() {
+                        overflow_guard.pop_front(); // Sent, remove from overflow
+                        sent = true;
+
+                        break; // Stop trying consumers for this message
+                    }
+                }
+
+                if sent {
+                    continue; // Message was sent, process next in overflow
+                } else if let Some(msg_to_move) = overflow_guard.pop_front() {
+                    // Message could not be sent to *any* consumer, move it to the back
+                    overflow_guard.push_back(msg_to_move);
                 }
             } else {
-                // Should not happen if !overflow_guard.is_empty(), but break defensively
+                // Should not happen if !overflow_guard.is_empty() passed
                 break;
             }
-
-            // If try_send failed, move to the next consumer for *this* message
-            consumer_idx = (consumer_idx + 1) % senders.len();
-            attempts += 1; // Increment attempts since this consumer failed
         }
+        // MutexGuard is dropped here, releasing the lock automatically.
     }
 }
