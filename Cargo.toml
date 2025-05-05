@@ -1,6 +1,6 @@
 [package]
 name = "rmq"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 
 [dependencies]
@@ -34,7 +34,7 @@ uuid = { version = "1.16.0", features = [
 eyre = "0.6.12"
 rand = "0.9.1"
 serial_test = "3.2.0"
-sysinfo = "0.34.2"
+sysinfo = "0.35.0"
 
 [features]
 default = []

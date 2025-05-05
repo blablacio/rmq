@@ -156,9 +156,12 @@ impl<M> MessageBuffer<M> {
 
         // Iterate while there are messages and we haven't tried all consumers in this pass
         let mut consumer_idx = 0;
+        let mut attempts = 0; // Track attempts to avoid infinite loops if all channels are full
 
-        while !overflow_guard.is_empty() && consumer_idx < senders.len() {
-            let sender = &senders[consumer_idx];
+        // Loop while there are messages AND we haven't fruitlessly tried every consumer
+        while !overflow_guard.is_empty() && attempts < senders.len() {
+            let current_sender_idx = consumer_idx % senders.len(); // Ensure index wraps around
+            let sender = &senders[current_sender_idx];
 
             // Peek at the front message without removing it yet
             if let Some(message) = overflow_guard.front() {
@@ -166,17 +169,21 @@ impl<M> MessageBuffer<M> {
                 if sender.try_send(message.clone()).is_ok() {
                     // Success! Remove the message from the front of the queue
                     overflow_guard.pop_front();
-                    // Reset index to try all consumers again for the next message
-                    consumer_idx = 0;
+                    // Move to the next consumer index for the *next* message
+                    consumer_idx = (consumer_idx + 1) % senders.len(); // Maintain round-robin
+                    attempts = 0; // Reset attempts since we successfully sent one
 
-                    continue; // Go to the next iteration of the while loop
+                    // Continue to the next message in the overflow buffer
+                    continue;
                 }
             } else {
                 // Should not happen if !overflow_guard.is_empty(), but break defensively
                 break;
             }
-            // Move to the next consumer *only if* the send failed for the current message
-            consumer_idx += 1;
+
+            // If try_send failed, move to the next consumer for *this* message
+            consumer_idx = (consumer_idx + 1) % senders.len();
+            attempts += 1; // Increment attempts since this consumer failed
         }
     }
 }
