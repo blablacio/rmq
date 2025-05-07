@@ -26,14 +26,15 @@ pub struct PrefetchConfig {
 
 #[derive(Clone)]
 pub struct QueueOptions {
-    pub pending_timeout: Option<u64>, // Timeout after which a message is reclaimed
+    pub initial_consumers: Option<u32>, // Initial number of consumers
+    pub pending_timeout: Option<u64>,   // Timeout after which a message is reclaimed
     pub retry_config: Option<RetryConfig>, // Retry configuration
-    pub poll_interval: Option<u64>,   // Interval for queue polling
-    pub dlq_name: Option<String>,     // Optional DLQ stream name
-    pub auto_recovery: Option<u64>,   // Automatically recover messages on startup after timeout
-    pub delete_on_ack: bool,          // Automatically delete messages from queue after ack
+    pub poll_interval: Option<u64>,     // Interval for queue polling
+    pub dlq_name: Option<String>,       // Optional DLQ stream name
+    pub auto_recovery: Option<u64>,     // Automatically recover messages on startup after timeout
+    pub delete_on_ack: bool,            // Automatically delete messages from queue after ack
     pub prefetch_config: Option<PrefetchConfig>, // Configuration for prefetching messages
-    pub retry_sync: RetrySyncPolicy,  // When to sync retry counts with Redis
+    pub retry_sync: RetrySyncPolicy,    // When to sync retry counts with Redis
 }
 
 #[derive(Clone, PartialEq)]
@@ -46,6 +47,7 @@ pub enum RetrySyncPolicy {
 impl Default for QueueOptions {
     fn default() -> Self {
         Self {
+            initial_consumers: None,
             pending_timeout: None,
             retry_config: None,
             poll_interval: Some(QueueDefaults::POLL_INTERVAL),

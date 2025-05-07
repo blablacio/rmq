@@ -25,6 +25,9 @@
 - **Message Prefetching**
   Efficient message prefetching reduces Redis calls and CPU usage, especially with many consumers.
 
+- **Manual Consumer Scaling**
+  Manually add or remove consumers as needed based on external configuration or workload demands.
+
 - **Auto-Scaling**
   Dynamically adjust the number of consumers based on workload to optimize resource usage and throughput.
 
@@ -369,6 +372,79 @@ let queue = QueueBuilder::<String>::new()
 
 Prefetching is particularly beneficial when you have many consumers (>10) or need to minimize CPU usage in systems with sporadic message activity.
 
+### Initial Consumers
+
+You can specify the number of consumers to start with when creating the queue using the `initial_consumers` option:
+
+```rust
+use rmq::{QueueBuilder, Consumer, Delivery};
+use async_trait::async_trait;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+// Define a consumer that can be cloned
+#[derive(Clone)]
+struct MyConsumer {
+    counter: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl Consumer for MyConsumer {
+    type Message = String;
+
+    async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
+        println!("Processing: {}", delivery.message);
+        self.counter.fetch_add(1, Ordering::SeqCst);
+        delivery.ack().await?;
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -> eyre::Result<()> {
+    let counter = Arc::new(AtomicU32::new(0));
+
+    let queue = QueueBuilder::<String>::new()
+        .url("redis://127.0.0.1:6379")
+        .stream("my_stream")
+        .group("my_group")
+        .initial_consumers(5) // Start with 5 consumer instances
+        .with_instance(MyConsumer { counter: counter.clone() })
+        .build()
+        .await?;
+
+    // The queue already has 5 consumers running, no need to register them manually
+
+    // Produce some messages
+    for i in 0..10 {
+        queue.produce(&format!("Message {}", i)).await?;
+    }
+
+    // Wait for processing to complete...
+
+    queue.shutdown(Some(2000)).await;
+    Ok(())
+}
+```
+
+The `initial_consumers` option requires that you also provide a consumer factory or instance using either `with_factory()` or `with_instance()`.
+
+### Manual Consumer Scaling
+
+In addition to auto-scaling, you can manually control the number of consumers using the `add_consumers` and `remove_consumers` methods:
+
+```rust
+// Add 3 more consumers
+queue.add_consumers(3).await?;
+
+// Remove 2 consumers
+queue.remove_consumers(2).await?;
+```
+
+This is useful for scenarios where consumer counts are controlled by external configuration or when you want to implement your own scaling logic based on application-specific metrics.
+
+When removing consumers, the queue will prioritize removing idle consumers first to minimize disruption to ongoing processing.
+
 ### Auto-Scaling
 
 **rmq** provides an automatic consumer scaling system that dynamically adjusts the number of active consumers based on workload:
@@ -534,6 +610,10 @@ _(As long as you have a local Redis instance accessible via `REDIS_URL` or the d
   Configure message prefetching and optional auto-scaling.
 - **`ScalingStrategy`**
   Implement custom scaling logic by implementing this trait.
+- **`initial_consumers`**
+  Start with a specific number of consumers when the queue is created.
+- **`add_consumers`/`remove_consumers`**
+  Manually scale the number of consumers up or down based on external conditions.
 
 ---
 

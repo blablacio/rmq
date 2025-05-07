@@ -33,6 +33,7 @@ use crate::{
     options::{QueueOptions, RetrySyncPolicy},
     prefetch::{ConsumerChannel, MessageBuffer},
     scaling::{ScaleAction, ScalingContext, ScalingStrategy},
+    RmqError,
 };
 
 #[derive(Clone)]
@@ -157,6 +158,29 @@ where
         {
             let scaling_task_handle = queue.start_scaling_task().await?;
             *queue.scaling_task.lock().await = Some(scaling_task_handle);
+        }
+
+        // Start initial consumers if configured
+        if let Some(initial_count) = queue.options.initial_consumers {
+            if initial_count > 0 {
+                if let Some(factory) = &queue.consumer_factory {
+                    debug!("Starting {} initial consumers...", initial_count);
+
+                    if let Err(e) = queue.scale_up(initial_count, factory).await {
+                        error!("Failed to start initial consumers: {}", e);
+
+                        return Err(crate::errors::RmqError::ConfigError(format!(
+                            "Failed to start initial consumers: {}",
+                            e
+                        )));
+                    }
+                } else {
+                    warn!(
+                        "Initial consumers configured ({}), but no consumer factory provided. Ignoring.",
+                        initial_count
+                    );
+                }
+            }
         }
 
         Ok(queue)
@@ -314,7 +338,6 @@ where
         self.tasks.len()
     }
 
-    // Add start_scaling_task method (implementation later)
     async fn start_scaling_task(&self) -> RmqResult<JoinHandle<()>> {
         // Ensure scaling is configured
         let scaling_config = self
@@ -425,7 +448,6 @@ where
         Ok(handle)
     }
 
-    // Add scale_up method (implementation later)
     async fn scale_up(
         &self,
         count: u32,
@@ -451,7 +473,6 @@ where
         Ok(())
     }
 
-    // Add scale_down method (implementation later)
     async fn scale_down(&self, count: u32) -> RmqResult<()> {
         debug!("Attempting to scale down by {} consumers", count);
 
@@ -623,6 +644,37 @@ where
         }
     }
 
+    /// Adds a specified number of consumers to the queue.
+    pub async fn add_consumers(&self, count: u32) -> RmqResult<()> {
+        if count == 0 {
+            return Ok(());
+        }
+
+        let factory = self.consumer_factory.clone().ok_or_else(|| {
+            RmqError::ConfigError("Consumer factory must be provided to add consumers.".to_string())
+        })?;
+
+        debug!("Attempting to add {} consumers via add_consumers", count);
+
+        self.scale_up(count, &factory).await
+    }
+
+    /// Removes a specified number of consumers from the queue.
+    /// It will attempt to remove idle consumers first.
+    pub async fn remove_consumers(&self, count: u32) -> RmqResult<()> {
+        if count == 0 {
+            return Ok(());
+        }
+
+        debug!(
+            "Attempting to remove {} consumers via remove_consumers",
+            count
+        );
+
+        self.scale_down(count).await
+    }
+
+    /// Registers a single consumer with the queue.
     pub async fn register_consumer<C>(&self, consumer: C) -> RmqResult<Uuid>
     where
         C: Consumer<Message = M>,

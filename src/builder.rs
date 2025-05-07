@@ -82,6 +82,7 @@ where
         // Update with provided options, but preserve any explicitly set values
         self.options = QueueOptions {
             // For simple Option<T> fields, use existing value if it's Some, otherwise use new value
+            initial_consumers: existing.initial_consumers.or(options.initial_consumers),
             pending_timeout: existing.pending_timeout.or(options.pending_timeout),
             poll_interval: existing.poll_interval.or(options.poll_interval),
             retry_config: existing.retry_config.or(options.retry_config),
@@ -106,6 +107,13 @@ where
             // Add other fields as needed
             ..options
         };
+
+        self
+    }
+
+    /// Set the initial number of consumers to start with
+    pub fn initial_consumers(mut self, count: u32) -> Self {
+        self.options.initial_consumers = Some(count);
 
         self
     }
@@ -300,32 +308,49 @@ where
             .ok_or_else(|| RmqError::ConfigError("`stream` not specified".to_string()))?;
         let group = self.group;
         let options = self.options;
+        let factory = self.factory.clone(); // Store factory reference for later use
 
-        // Validate scaling configuration
-        let (consumer_factory, scaling_strategy) =
-            if let Some(prefetch_config) = &options.prefetch_config {
-                if prefetch_config.scaling.is_some() {
-                    // Scaling enabled, factory is required
-                    let factory = self.factory.ok_or_else(|| {
-                        RmqError::ConfigError(
-                            "Consumer factory must be provided when scaling is enabled".to_string(),
-                        )
-                    })?;
+        // Validate that if initial_consumers is set, we have a factory
+        if let Some(count) = options.initial_consumers {
+            if count > 0 && factory.is_none() {
+                return Err(RmqError::ConfigError(
+                    "initial_consumers specified without providing a consumer factory or instance"
+                        .to_string(),
+                ));
+            }
+        }
 
-                    // Use default strategy if none provided
-                    let strategy = self
-                        .scaling_strategy
-                        .unwrap_or_else(|| Arc::new(DefaultScalingStrategy));
-
-                    (Some(factory), Some(strategy))
-                } else {
-                    // Scaling disabled
-                    (None, None)
+        // Validate scaling configuration and get strategy
+        let scaling_strategy = if let Some(prefetch_config) = &options.prefetch_config {
+            if let Some(scaling) = &prefetch_config.scaling {
+                // Check min/max relationship
+                if scaling.min_consumers > scaling.max_consumers {
+                    return Err(RmqError::ConfigError(format!(
+                        "min_consumers ({}) cannot be greater than max_consumers ({})",
+                        scaling.min_consumers, scaling.max_consumers
+                    )));
                 }
+
+                // Scaling enabled, factory is required
+                if factory.is_none() {
+                    return Err(RmqError::ConfigError(
+                        "Consumer factory must be provided when scaling is enabled".to_string(),
+                    ));
+                }
+
+                // Use default strategy if none provided
+                Some(
+                    self.scaling_strategy
+                        .unwrap_or_else(|| Arc::new(DefaultScalingStrategy)),
+                )
             } else {
-                // Prefetch disabled (implies scaling disabled)
-                (None, None)
-            };
+                // Scaling disabled
+                None
+            }
+        } else {
+            // Prefetch disabled (implies scaling disabled)
+            None
+        };
 
         let client = match self.client {
             Some(c) => c,
@@ -342,13 +367,13 @@ where
             }
         };
 
-        // Pass validated factory and strategy to Queue::new
+        // Pass the factory to Queue::new regardless of scaling configuration
         Queue::new(
             client,
             stream,
             group,
             options,
-            consumer_factory,
+            factory, // Always pass the factory if it exists
             scaling_strategy,
         )
         .await

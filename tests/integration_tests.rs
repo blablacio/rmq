@@ -1085,6 +1085,7 @@ async fn test_long_delay_high_retry_manual_queue() -> eyre::Result<()> {
             let mut att = self.attempts.lock().await;
             *att += 1;
             if *att < 50 {
+                // Fail first 49 attempts
                 Err(ConsumerError::new(TestError(
                     format!("Fail attempt {}", *att).into(),
                 )))
@@ -1889,6 +1890,11 @@ async fn test_shutdown_during_error_handling() -> eyre::Result<()> {
     client.wait_for_connect().await?;
     let client = Arc::new(client);
 
+    let stream_name = "shutdown_error_stream";
+    let group_name = "shutdown_error_group";
+
+    client.del::<String, _>(stream_name).await?;
+
     /// A consumer that always fails and always retries (should_retry = true).
     struct FailingRetryConsumer {
         attempts: Arc<Mutex<u32>>,
@@ -1913,9 +1919,6 @@ async fn test_shutdown_during_error_handling() -> eyre::Result<()> {
             true // Always retry
         }
     }
-
-    let stream_name = "shutdown_error_stream";
-    let group_name = "shutdown_error_group";
 
     let queue = Queue::<TestMessage>::new(
         client.clone(),
@@ -2205,6 +2208,7 @@ async fn test_prefetch_performance_comparison() -> eyre::Result<()> {
         // Wait for all messages to be processed
         while processed_count.load(Ordering::SeqCst) < message_count {
             sleep(Duration::from_millis(100)).await;
+
             if start.elapsed() > Duration::from_secs(120) {
                 return Err(eyre::eyre!("Test timed out"));
             }
@@ -3810,6 +3814,135 @@ async fn test_auto_scaling_shutdown() -> eyre::Result<()> {
     );
 
     // Cleanup (redundant if shutdown worked, but good practice)
+    let _ = client
+        .xgroup_destroy::<(), _, _>(stream_name, group_name)
+        .await;
+    let _ = client.del::<(), _>(stream_name).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_initial_consumers_configuration() -> eyre::Result<()> {
+    let stream_name = "initial_consumers_stream";
+    let group_name = "initial_consumers_group";
+    let client = Client::new(Config::from_url(&get_redis_url())?, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+    let _ = client.del::<(), _>(stream_name).await;
+
+    let initial_count = 3;
+    let processed_counter = Arc::new(AtomicU32::new(0));
+
+    // Create queue with initial_consumers set
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(stream_name)
+        .group(group_name)
+        .initial_consumers(initial_count)
+        .with_instance(SimpleDelayedConsumer {
+            delay_ms: 50,
+            processed_count: processed_counter.clone(),
+        })
+        .build()
+        .await?;
+
+    // Check that the initial consumers were created
+    let consumer_count = queue.consumer_count();
+    assert_eq!(
+        consumer_count, initial_count as usize,
+        "Should have exactly {} consumers at startup",
+        initial_count
+    );
+
+    // Produce some messages to verify the consumers are working
+    let message_count = 10;
+    for i in 0..message_count {
+        queue
+            .produce(&TestMessage {
+                content: format!("Initial {}", i),
+            })
+            .await?;
+    }
+
+    // Wait for messages to be processed
+    for _ in 0..50 {
+        if processed_counter.load(Ordering::SeqCst) >= message_count {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let processed = processed_counter.load(Ordering::SeqCst);
+    assert_eq!(
+        processed, message_count,
+        "Initial consumers should process all messages"
+    );
+
+    // Test adding more consumers manually
+    let additional = 2;
+    queue.add_consumers(additional).await?;
+
+    assert_eq!(
+        queue.consumer_count(),
+        (initial_count + additional) as usize,
+        "Should have {} total consumers after adding {}",
+        initial_count + additional,
+        additional
+    );
+
+    // Test removing some consumers
+    let remove_count = 3;
+    queue.remove_consumers(remove_count).await?;
+
+    assert_eq!(
+        queue.consumer_count(),
+        (initial_count + additional - remove_count) as usize,
+        "Should have {} total consumers after removing {}",
+        initial_count + additional - remove_count,
+        remove_count
+    );
+
+    // Cleanup
+    queue.shutdown(Some(2000)).await;
+    client
+        .xgroup_destroy::<(), _, _>(stream_name, group_name)
+        .await?;
+    client.del::<(), _>(stream_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_initial_consumers_validation() -> eyre::Result<()> {
+    let stream_name = "initial_consumers_validation_stream";
+    let group_name = "initial_consumers_validation_group";
+    let client = Client::new(Config::from_url(&get_redis_url())?, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+
+    // Attempt to build a queue with initial_consumers but no factory/instance
+    let build_result = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(stream_name)
+        .group(group_name)
+        .initial_consumers(3) // Set initial consumers
+        // Intentionally omit .with_factory() or .with_instance()
+        .build()
+        .await;
+
+    // Verify that the build fails with appropriate error
+    assert!(build_result.is_err(), "Build should fail without factory");
+    if let Err(e) = build_result {
+        let error_message = e.to_string();
+        assert!(
+            error_message.contains("initial_consumers") && error_message.contains("factory"),
+            "Error should mention missing factory for initial_consumers: {}",
+            error_message
+        );
+    }
+
+    // Cleanup (though build should have failed)
     let _ = client
         .xgroup_destroy::<(), _, _>(stream_name, group_name)
         .await;
