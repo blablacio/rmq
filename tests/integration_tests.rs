@@ -764,7 +764,7 @@ async fn test_manual_queue_retries_until_success() -> Result<(), Box<dyn Error>>
 
     // Wait enough time for attempts: initial + 2 retries with no delays should be quick
     // But let's wait a bit to be safe.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    sleep(Duration::from_secs(2)).await;
 
     let at = *attempts.lock().await;
     // Expected attempts = 3 (initial attempt + 2 retries, succeed on 3rd)
@@ -847,7 +847,7 @@ async fn test_manual_queue_exhaust_retries() -> eyre::Result<()> {
     queue.produce(&msg).await?;
 
     // Wait a bit to allow the attempts
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    sleep(Duration::from_secs(2)).await;
 
     let at = *attempts.lock().await;
     // Expected attempts = initial (1) + max_retries (2) = 3 total attempts, all fail, then ack and stop.
@@ -941,7 +941,7 @@ async fn test_idempotent_processing() -> eyre::Result<()> {
     };
     queue.produce(&msg).await?;
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    sleep(Duration::from_secs(2)).await;
 
     let counter_val = *global_counter.lock().await;
     assert_eq!(
@@ -1023,7 +1023,7 @@ async fn test_infinite_retry_loop_in_stealing_queue() -> eyre::Result<()> {
     queue.produce(&msg).await?;
 
     // Wait a few seconds to allow multiple reclaims
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(5)).await;
 
     let at = *attempts.lock().await;
     // After 5 seconds with a pending_timeout of 1 second, we expect multiple attempts.
@@ -1108,7 +1108,7 @@ async fn test_long_delay_high_retry_manual_queue() -> eyre::Result<()> {
     queue.produce(&msg).await?;
 
     // This test might run for a while due to long delays. Wait enough time for ~50 attempts * 1s delay.
-    tokio::time::sleep(Duration::from_secs(60)).await; // 50 attempts * 1s = 50s, + overhead.
+    sleep(Duration::from_secs(60)).await; // 50 attempts * 1s = 50s, + overhead.
 
     let at = *attempts.lock().await;
     // Expect at == 50 total attempts
@@ -1277,7 +1277,7 @@ async fn test_time_based_retry_logic() -> eyre::Result<()> {
 
     // Wait enough time for several attempts. The consumer tries until attempt <5 succeeds.
     // With 0.5s delay, ~2-3 seconds should suffice for 5 attempts.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(5)).await;
 
     let at = *attempts.lock().await;
     // Expect attempts = 5 total
@@ -3947,5 +3947,340 @@ async fn test_initial_consumers_validation() -> eyre::Result<()> {
         .xgroup_destroy::<(), _, _>(stream_name, group_name)
         .await;
     let _ = client.del::<(), _>(stream_name).await;
+    Ok(())
+}
+
+// --- Producer-Only Tests ---
+
+// Helper to get a connected client and unique stream/group names for testing producer-only
+async fn setup_producer_only_test_environment(test_name: &str) -> (Arc<Client>, String, String) {
+    let config = Config::from_url(&get_redis_url()).expect("Failed to parse Redis URL");
+    let client = Arc::new(Client::new(config, None, None, None));
+    client.connect();
+    client
+        .wait_for_connect()
+        .await
+        .expect("Failed to connect to Redis for producer-only test");
+
+    let stream_name = format!(
+        "test_stream_po_{}_{}",
+        test_name,
+        uuid::Uuid::now_v7().as_simple()
+    );
+    let group_name = format!(
+        "test_group_po_{}_{}",
+        test_name,
+        uuid::Uuid::now_v7().as_simple()
+    );
+
+    (client, stream_name, group_name)
+}
+
+// Dummy consumer and factory for tests that might need them
+// Uses the existing TestMessage struct from integration_tests.rs
+struct ProducerOnlyTestConsumer; // Shortened name for "Producer-Only Test Consumer"
+#[async_trait]
+impl Consumer for ProducerOnlyTestConsumer {
+    type Message = TestMessage;
+    async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
+        // In most producer-only tests, this consumer won't actually be used.
+        // If a test *does* try to run it (e.g. a misconfigured non-producer-only queue),
+        // it should ack to prevent message buildup.
+        delivery.ack().await?;
+
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_po_builder_direct_method() -> eyre::Result<()> {
+    let (client, stream_name, group_name) = setup_producer_only_test_environment("po_direct").await;
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(&stream_name)
+        .group(&group_name)
+        .producer_only(true)
+        .build()
+        .await?;
+
+    assert_eq!(
+        queue.consumer_count(),
+        0,
+        "Producer-only queue should have 0 consumers"
+    );
+
+    let produce_result = queue
+        .produce(&TestMessage {
+            content: "hello_po_direct".into(),
+        })
+        .await;
+
+    assert!(
+        produce_result.is_ok(),
+        "Should be able to produce to a producer-only queue: {:?}",
+        produce_result.err()
+    );
+
+    let add_consumers_result = queue.add_consumers(1).await;
+
+    assert!(
+        matches!(add_consumers_result, Err(rmq::RmqError::ConfigError(_))),
+        "add_consumers should fail"
+    );
+
+    let register_result = queue.register_consumer(ProducerOnlyTestConsumer).await;
+
+    assert!(
+        matches!(register_result, Err(rmq::RmqError::ConfigError(_))),
+        "register_consumer should fail"
+    );
+
+    let remove_consumers_result = queue.remove_consumers(1).await;
+
+    assert!(
+        matches!(remove_consumers_result, Err(rmq::RmqError::ConfigError(_))),
+        "remove_consumers should fail"
+    );
+
+    queue.shutdown(Some(100)).await;
+    client.del::<(), _>(&[&stream_name]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_po_builder_options_true() -> eyre::Result<()> {
+    let (client, stream_name, group_name) =
+        setup_producer_only_test_environment("po_options_true").await;
+
+    let mut options = QueueOptions::default();
+    options.producer_only = true;
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(&stream_name)
+        .group(&group_name)
+        .options(options)
+        .build()
+        .await?;
+
+    assert_eq!(queue.consumer_count(), 0, "Consumer count should be 0");
+    assert!(queue
+        .produce(&TestMessage {
+            content: "hello_po_options".into()
+        })
+        .await
+        .is_ok());
+    assert!(matches!(
+        queue.add_consumers(1).await,
+        Err(rmq::RmqError::ConfigError(_))
+    ));
+
+    queue.shutdown(Some(100)).await;
+    client.del::<(), _>(&[&stream_name]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_po_builder_conflicting_consumer_settings() -> eyre::Result<()> {
+    let (client, stream_name, group_name) =
+        setup_producer_only_test_environment("po_conflicting").await;
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(&stream_name)
+        .group(&group_name)
+        .producer_only(true)
+        .initial_consumers(5)
+        .with_factory(|| ProducerOnlyTestConsumer {})
+        .prefetch_count(10)
+        .scaling_config(1, 5, 1000)
+        .build()
+        .await?;
+
+    assert_eq!(
+        queue.consumer_count(),
+        0,
+        "Consumer count should be 0 despite conflicting settings"
+    );
+    assert!(queue
+        .produce(&TestMessage {
+            content: "po_conflict_test".into()
+        })
+        .await
+        .is_ok());
+    assert!(matches!(
+        queue.add_consumers(1).await,
+        Err(rmq::RmqError::ConfigError(_))
+    ));
+
+    queue.shutdown(Some(100)).await;
+    client.del::<(), _>(&[&stream_name]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_po_builder_options_override_respects_method_true() -> eyre::Result<()> {
+    let (client, stream_name, group_name) =
+        setup_producer_only_test_environment("po_override_options").await;
+
+    let mut consumer_opts = QueueOptions::default();
+    consumer_opts.producer_only = false;
+    consumer_opts.initial_consumers = Some(1);
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(&stream_name)
+        .group(&group_name)
+        .with_factory(|| ProducerOnlyTestConsumer {})
+        .producer_only(true) // Explicitly set to producer_only via method
+        .options(consumer_opts) // Then apply options that say producer_only=false
+        .build()
+        .await?;
+
+    assert_eq!(
+        queue.consumer_count(),
+        0,
+        "Should be 0 consumers as producer_only(true) method call should take precedence"
+    );
+
+    queue.shutdown(Some(100)).await;
+    client.del::<(), _>(&[&stream_name]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_po_builder_options_true_then_method_false() -> eyre::Result<()> {
+    let (client, stream_name, group_name) =
+        setup_producer_only_test_environment("po_options_true_method_false").await;
+
+    let mut producer_opts = QueueOptions::default();
+    producer_opts.producer_only = true;
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(&stream_name)
+        .group(&group_name)
+        .options(producer_opts.clone()) // producer_only is true via options
+        .producer_only(false) // Then explicitly set to false by method call
+        .initial_consumers(1)
+        .with_factory(|| ProducerOnlyTestConsumer {})
+        .build()
+        .await?;
+
+    sleep(Duration::from_millis(100)).await; // Give time for consumer to start
+    assert_eq!(
+        queue.consumer_count(),
+        1,
+        "Should have 1 consumer as producer_only(false) was last and initial_consumers set"
+    );
+
+    let add_result = queue.add_consumers(1).await;
+    assert!(
+        !matches!(add_result, Err(rmq::RmqError::ConfigError(_))),
+        "add_consumers should not be a config error"
+    );
+
+    queue.shutdown(Some(100)).await;
+    client.del::<(), _>(&[&stream_name]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_po_non_producer_only_queue() -> eyre::Result<()> {
+    let (client, stream_name, group_name) =
+        setup_producer_only_test_environment("po_non_producer_only").await;
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(&stream_name)
+        .group(&group_name)
+        .producer_only(false)
+        .initial_consumers(1)
+        .with_factory(|| ProducerOnlyTestConsumer {})
+        .build()
+        .await?;
+
+    sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(queue.consumer_count(), 1, "Should start initial consumer");
+    assert!(!matches!(
+        queue.add_consumers(1).await,
+        Err(rmq::RmqError::ConfigError(_))
+    ));
+
+    queue.shutdown(Some(100)).await;
+    client.del::<(), _>(&[&stream_name]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_po_direct_queue_new_producer_only() -> eyre::Result<()> {
+    let (client, stream_name, group_name) =
+        setup_producer_only_test_environment("po_direct_new_true").await;
+    let mut opts = QueueOptions::default();
+    opts.producer_only = true;
+
+    let queue = Queue::<TestMessage>::new(
+        client.clone(),
+        stream_name.clone(),
+        Some(group_name.clone()),
+        opts,
+        None,
+        None,
+    )
+    .await?;
+
+    assert_eq!(queue.consumer_count(), 0);
+    assert!(queue
+        .produce(&TestMessage {
+            content: "po_direct_new".into()
+        })
+        .await
+        .is_ok());
+    assert!(matches!(
+        queue.add_consumers(1).await,
+        Err(rmq::RmqError::ConfigError(_))
+    ));
+
+    queue.shutdown(Some(100)).await;
+    client.del::<(), _>(&[&stream_name]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_po_direct_queue_new_producer_only_with_conflicting_factory() -> eyre::Result<()> {
+    let (client, stream_name, group_name) =
+        setup_producer_only_test_environment("po_direct_new_conflict").await;
+    let mut opts = QueueOptions::default();
+    opts.producer_only = true;
+    opts.initial_consumers = Some(2);
+
+    let queue = Queue::<TestMessage>::new(
+        client.clone(),
+        stream_name.clone(),
+        Some(group_name.clone()),
+        opts,
+        Some(Arc::new(|| Arc::new(ProducerOnlyTestConsumer {}))),
+        None,
+    )
+    .await?;
+
+    assert_eq!(
+        queue.consumer_count(),
+        0,
+        "Consumers should not start if producer_only, despite factory and initial_consumers"
+    );
+
+    queue.shutdown(Some(100)).await;
+    client.del::<(), _>(&[&stream_name]).await?;
+
     Ok(())
 }

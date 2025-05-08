@@ -35,6 +35,7 @@ pub struct QueueOptions {
     pub delete_on_ack: bool,            // Automatically delete messages from queue after ack
     pub prefetch_config: Option<PrefetchConfig>, // Configuration for prefetching messages
     pub retry_sync: RetrySyncPolicy,    // When to sync retry counts with Redis
+    pub producer_only: bool,            // Producer-only mode
 }
 
 #[derive(Clone, PartialEq)]
@@ -61,6 +62,7 @@ impl Default for QueueOptions {
                 scaling: None,   // No scaling by default
             }),
             retry_sync: RetrySyncPolicy::OnEachRetry, // Keep current behavior as default
+            producer_only: false,                     // Default to false
         }
     }
 }

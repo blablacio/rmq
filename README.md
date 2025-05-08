@@ -34,6 +34,9 @@
 - **Integration-Ready**
   Easily run integration tests against a local or containerized Redis instance for reliable testing in CI/CD pipelines.
 
+- **Producer-Only Queues**
+  Configure queue instances to operate in a producer-only mode, disabling consumer-related functionalities like prefetching and scaling, ideal for services that only need to publish messages.
+
 ---
 
 ## Getting Started
@@ -223,6 +226,7 @@ async fn main() -> eyre::Result<()> {
             poll_interval: Some(50),      // Custom poll interval
             pending_timeout: Some(5000),  // Custom pending timeout
             dlq_name: Some("my_dlq_stream".to_string()), // Or use a Dead-Letter Queue
+            producer_only: false, // Default is false, can be set to true for producer-only instances
             ..Default::default()
         })
         .build()
@@ -257,11 +261,79 @@ let options = QueueOptions {
     delete_on_ack: true,        // Delete messages after successful acknowledgment
     poll_interval: Some(50),      // Custom poll interval
     dlq_name: Some("my_dlq_stream".to_string()), // Or use a Dead-Letter Queue
+    producer_only: false,       // Set to true for a producer-only queue instance
     ..Default::default()
 };
 ```
 
 When a consumer fails, the queue decides (based on `should_retry()`) if the message is retried or moved to the DLQ.
+
+### Producer-Only Queues
+
+For scenarios where a service instance only needs to produce messages and will never consume them, **rmq** allows configuring a queue instance in "producer-only" mode. This optimizes the queue by disabling all consumer-related functionalities for that specific instance, such as:
+
+- Message prefetching
+- Consumer task initialization (including initial consumers)
+- Auto-scaling
+- Consumer registration or manual scaling via `add_consumers`/`remove_consumers` (these calls will return a `ConfigError`).
+
+This reduces overhead and resource usage for services that solely act as message publishers.
+
+#### Configuration via `QueueOptions`
+
+You can set the `producer_only` flag directly in `QueueOptions`:
+
+```rust
+use rmq::QueueOptions;
+
+let options = QueueOptions {
+    producer_only: true, // This instance will only produce messages
+    // Other options like prefetch_config, initial_consumers, etc., will be ignored
+    // or have no effect if producer_only is true.
+    ..Default::default()
+};
+
+// Use these options when creating a queue via Queue::new or Queue::from_url
+let producer_queue = Queue::<String>::from_url(
+    "redis://127.0.0.1:6379",
+    "my_producer_stream",
+    Some("my_group_for_other_consumers"), // Group might still be relevant for other (consuming) services
+    options
+).await?;
+```
+
+It's important to note that even for a producer-only queue, specifying a `group` name can still be relevant if other, separate consumer services will use that same group to consume from the stream. If this producer instance should not interact with or create the consumer group at all, you can pass `Some("")` as the group name.
+
+#### Configuration via `QueueBuilder`
+
+The `QueueBuilder` provides a dedicated method:
+
+```rust
+use rmq::QueueBuilder;
+
+// #[tokio::main]
+// async fn main() -> eyre::Result<()> {
+let producer_queue = QueueBuilder::<String>::new()
+    .url("redis://127.0.0.1:6379")
+    .stream("my_producer_stream")
+    .group("my_group_for_other_consumers") // Or Some("") if this instance shouldn't manage the group
+    .producer_only(true) // Configure as producer-only
+    // Any consumer-specific builder methods like .initial_consumers(), .with_factory(),
+    // .prefetch_count(), .scaling_config() will be ignored and may log warnings.
+    .build()
+    .await?;
+
+// producer_queue can now only be used for producing messages.
+producer_queue.produce(&"a message".to_string()).await?;
+let res = producer_queue.add_consumers(1).await;
+assert!(matches!(res, Err(rmq::RmqError::ConfigError(_))));
+
+producer_queue.shutdown(None).await?;
+Ok(())
+// }
+```
+
+Using producer-only mode ensures that your publishing services remain lightweight and efficient, without the overhead of consumer logic they don't need.
 
 ### Understanding Delivery Counts & Retries
 
@@ -614,6 +686,8 @@ _(As long as you have a local Redis instance accessible via `REDIS_URL` or the d
   Start with a specific number of consumers when the queue is created.
 - **`add_consumers`/`remove_consumers`**
   Manually scale the number of consumers up or down based on external conditions.
+- **`producer_only` (in `QueueOptions`)**
+  Configure a queue instance to only produce messages, disabling consumer functionalities.
 
 ---
 

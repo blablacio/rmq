@@ -72,12 +72,14 @@ where
     ///
     /// This is a convenience method for bulk configuration. Settings already
     /// configured via specific builder methods (like `prefetch_count()`,
-    /// `auto_recovery()`, etc.) will be preserved and take precedence.
+    /// `auto_recovery()`, `producer_only()`, etc.) will be preserved if they
+    /// differ from the default, otherwise the values from the provided `options`
+    /// argument will be used.
     ///
     /// For more fine-grained control, use the individual setter methods instead.
     pub fn options(mut self, options: QueueOptions) -> Self {
-        // Save existing settings that might have been set via builder methods
-        let existing = self.options;
+        let existing = self.options; // Current options set by builder methods
+        let default_options = QueueOptions::default();
 
         // Update with provided options, but preserve any explicitly set values
         self.options = QueueOptions {
@@ -89,21 +91,24 @@ where
             dlq_name: existing.dlq_name.or(options.dlq_name),
             auto_recovery: existing.auto_recovery.or(options.auto_recovery),
 
-            // For prefetch_config, more complex merging might be needed
             prefetch_config: match (existing.prefetch_config, options.prefetch_config) {
-                // If existing has value, preserve it (builder methods took precedence)
-                (Some(config), _) => Some(config),
-                // Otherwise use the new value
-                (None, new_config) => new_config,
+                (Some(config), _) => Some(config), // If existing has value, preserve it
+                (None, new_config) => new_config,  // Otherwise use the new value
             },
 
-            // For non-Option fields, prefer existing value if it was explicitly changed from default
-            retry_sync: if existing.retry_sync != QueueOptions::default().retry_sync {
+            retry_sync: if existing.retry_sync != default_options.retry_sync {
                 existing.retry_sync
             } else {
                 options.retry_sync
             },
 
+            producer_only: if existing.producer_only != default_options.producer_only {
+                // Check if explicitly set
+                existing.producer_only
+            } else {
+                options.producer_only
+            },
+            delete_on_ack: options.delete_on_ack,
             // Add other fields as needed
             ..options
         };
@@ -158,13 +163,13 @@ where
     /// This initializes or updates the prefetch configuration.
     pub fn prefetch_count(mut self, count: u32) -> Self {
         let buffer_size = self.options.prefetch_config.as_ref().map_or(
-            QueueOptions::default().prefetch_config.unwrap().buffer_size, // Use default buffer size if not set
+            QueueOptions::default().prefetch_config.unwrap().buffer_size,
             |config| config.buffer_size,
         );
         self.options.prefetch_config = Some(PrefetchConfig {
             count,
             buffer_size,
-            scaling: None,
+            scaling: self.options.prefetch_config.and_then(|pc| pc.scaling), // Preserve existing scaling
         });
 
         self
@@ -177,13 +182,13 @@ where
     /// This initializes or updates the prefetch configuration.
     pub fn buffer_size(mut self, buffer_size: usize) -> Self {
         let count = self.options.prefetch_config.as_ref().map_or(
-            QueueOptions::default().prefetch_config.unwrap().count, // Use default count if not set
+            QueueOptions::default().prefetch_config.unwrap().count,
             |config| config.count,
         );
         self.options.prefetch_config = Some(PrefetchConfig {
             count,
             buffer_size,
-            scaling: None,
+            scaling: self.options.prefetch_config.and_then(|pc| pc.scaling), // Preserve existing scaling
         });
 
         self
@@ -292,11 +297,33 @@ where
     /// Enable/disable auto-recovery.
     pub fn with_auto_recovery(mut self, enabled: bool) -> Self {
         if enabled {
-            // Use default value if enabling without specific timeout
-            self.options.auto_recovery = Some(5000); // Default value
+            self.options.auto_recovery = Some(
+                self.options
+                    .auto_recovery
+                    .unwrap_or(QueueOptions::default().auto_recovery.unwrap_or(5000)),
+            );
         } else {
             self.options.auto_recovery = None;
         }
+
+        self
+    }
+
+    /// Configures the queue instance to be producer-only.
+    ///
+    /// If set to `true`:
+    /// - No consumers will be started by this queue instance.
+    /// - Prefetching will be disabled (any `prefetch_config` will be ignored).
+    /// - Scaling will be disabled (any `scaling_config` will be ignored).
+    /// - Calls to `add_consumers`, `remove_consumers`, `register_consumer` on the `Queue` will fail.
+    /// - Any provided `consumer_factory`, `scaling_strategy`, or `initial_consumers`
+    ///   will be ignored for this instance and may produce warnings during build.
+    ///
+    /// This setting takes precedence. If `options()` is called later with a
+    /// `QueueOptions` struct where `producer_only` is false, this explicit
+    /// setting via `producer_only(true)` will still be respected.
+    pub fn producer_only(mut self, producer_only: bool) -> Self {
+        self.options.producer_only = producer_only;
 
         self
     }
@@ -307,50 +334,66 @@ where
             .stream
             .ok_or_else(|| RmqError::ConfigError("`stream` not specified".to_string()))?;
         let group = self.group;
-        let options = self.options;
-        let factory = self.factory.clone(); // Store factory reference for later use
 
-        // Validate that if initial_consumers is set, we have a factory
-        if let Some(count) = options.initial_consumers {
-            if count > 0 && factory.is_none() {
-                return Err(RmqError::ConfigError(
-                    "initial_consumers specified without providing a consumer factory or instance"
-                        .to_string(),
-                ));
+        // If producer_only is true, warn about consumer-specific configurations
+        if self.options.producer_only {
+            if self.factory.is_some() {
+                warn!("QueueBuilder: 'producer_only' is true, but a 'consumer_factory' was provided. It will be ignored for this queue instance.");
+            }
+            if self.scaling_strategy.is_some() {
+                warn!("QueueBuilder: 'producer_only' is true, but a 'scaling_strategy' was provided. It will be ignored for this queue instance.");
+            }
+            if self.options.initial_consumers.map_or(false, |c| c > 0) {
+                warn!("QueueBuilder: 'producer_only' is true, but 'initial_consumers' > 0. No consumers will be started.");
+            }
+            if self.options.prefetch_config.is_some() {
+                warn!("QueueBuilder: 'producer_only' is true, but 'prefetch_config' was provided. Prefetching will be disabled.");
+                // Queue::new will set prefetch_config to None if producer_only is true.
+            }
+            // No need to nullify them here, Queue::new will handle it based on options.producer_only
+        } else {
+            // Validations for consumer-based queue
+            if let Some(count) = self.options.initial_consumers {
+                if count > 0 && self.factory.is_none() {
+                    return Err(RmqError::ConfigError(
+                        "initial_consumers specified without providing a consumer factory or instance"
+                            .to_string(),
+                    ));
+                }
             }
         }
 
-        // Validate scaling configuration and get strategy
-        let scaling_strategy = if let Some(prefetch_config) = &options.prefetch_config {
-            if let Some(scaling) = &prefetch_config.scaling {
-                // Check min/max relationship
-                if scaling.min_consumers > scaling.max_consumers {
-                    return Err(RmqError::ConfigError(format!(
-                        "min_consumers ({}) cannot be greater than max_consumers ({})",
-                        scaling.min_consumers, scaling.max_consumers
-                    )));
-                }
+        // Validate scaling configuration and get strategy (only if not producer_only)
+        let mut scaling_strategy = None;
 
-                // Scaling enabled, factory is required
-                if factory.is_none() {
-                    return Err(RmqError::ConfigError(
-                        "Consumer factory must be provided when scaling is enabled".to_string(),
-                    ));
-                }
+        if !self.options.producer_only {
+            // Scaling is only relevant if the queue is not producer-only.
+            if let Some(prefetch_config) = &self.options.prefetch_config {
+                // Scaling also requires prefetching to be enabled.
+                if let Some(scaling_opts) = &prefetch_config.scaling {
+                    // Now, perform validations specific to scaling.
+                    if scaling_opts.min_consumers > scaling_opts.max_consumers {
+                        return Err(RmqError::ConfigError(format!(
+                            "min_consumers ({}) cannot be greater than max_consumers ({})",
+                            scaling_opts.min_consumers, scaling_opts.max_consumers
+                        )));
+                    }
 
-                // Use default strategy if none provided
-                Some(
-                    self.scaling_strategy
-                        .unwrap_or_else(|| Arc::new(DefaultScalingStrategy)),
-                )
-            } else {
-                // Scaling disabled
-                None
+                    if self.factory.is_none() {
+                        return Err(RmqError::ConfigError(
+                            "Consumer factory must be provided when scaling is enabled".to_string(),
+                        ));
+                    }
+
+                    // If scaling is configured, use the strategy from the builder's `self.scaling_strategy`
+                    // if it was explicitly set. Otherwise, fall back to the default scaling strategy.
+                    scaling_strategy = self
+                        .scaling_strategy
+                        .clone()
+                        .or_else(|| Some(Arc::new(DefaultScalingStrategy)));
+                }
             }
-        } else {
-            // Prefetch disabled (implies scaling disabled)
-            None
-        };
+        }
 
         let client = match self.client {
             Some(c) => c,
@@ -361,20 +404,22 @@ where
                 let config = Config::from_url(&url)?;
                 let new_client = Arc::new(Client::new(config, None, None, None));
                 new_client.connect();
-                new_client.wait_for_connect().await?;
+
+                if let Err(e) = new_client.wait_for_connect().await {
+                    return Err(e.into());
+                }
 
                 new_client
             }
         };
 
-        // Pass the factory to Queue::new regardless of scaling configuration
         Queue::new(
             client,
             stream,
             group,
-            options,
-            factory, // Always pass the factory if it exists
-            scaling_strategy,
+            self.options,     // Pass the potentially modified options
+            self.factory,     // Pass factory; Queue::new will ignore if producer_only
+            scaling_strategy, // Pass strategy; Queue::new will ignore if producer_only
         )
         .await
     }

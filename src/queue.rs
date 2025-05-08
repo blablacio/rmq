@@ -79,7 +79,22 @@ where
     ) -> RmqResult<Self> {
         let group = group.unwrap_or_else(|| "default_group".to_string());
 
-        // Only create the group if group_name is provided
+        if options.producer_only {
+            if options.prefetch_config.is_some() {
+                warn!("Queue configured as 'producer_only': 'prefetch_config' will be ignored and prefetching disabled.");
+            }
+            if options.initial_consumers.map_or(false, |c| c > 0) {
+                warn!("Queue configured as 'producer_only': 'initial_consumers' will be ignored.");
+            }
+            if consumer_factory.is_some() {
+                warn!("Queue configured as 'producer_only': 'consumer_factory' will be ignored for this queue instance.");
+            }
+            if scaling_strategy.is_some() {
+                warn!("Queue configured as 'producer_only': 'scaling_strategy' will be ignored for this queue instance.");
+            }
+        }
+
+        // Only create the group if group_name is provided and not empty
         if !group.is_empty() {
             client
                 .xgroup_create(&stream, &group, "$", true)
@@ -108,15 +123,19 @@ where
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        // Initialize MessageBuffer only if prefetching is enabled
-        let message_buffer = if let Some(config) = &options.prefetch_config {
-            // Validate scaling config dependency
-            if config.scaling.is_some() && consumer_factory.is_none() {
-                return Err(crate::errors::RmqError::ConfigError(
-                    "Consumer factory must be provided when scaling is enabled".to_string(),
-                ));
+        // Initialize MessageBuffer only if prefetching is enabled AND NOT producer_only
+        let message_buffer = if !options.producer_only {
+            if let Some(config) = &options.prefetch_config {
+                // Validate scaling config dependency
+                if config.scaling.is_some() && consumer_factory.is_none() {
+                    return Err(crate::errors::RmqError::ConfigError(
+                        "Consumer factory must be provided when scaling is enabled".to_string(),
+                    ));
+                }
+                Some(Arc::new(MessageBuffer::new(config.buffer_size)))
+            } else {
+                None
             }
-            Some(Arc::new(MessageBuffer::new(config.buffer_size)))
         } else {
             None
         };
@@ -134,7 +153,7 @@ where
             tasks: Arc::new(DashMap::new()),
             shutdown_tx,
             shutdown_rx,
-            message_buffer, // Assign the Option<Arc<MessageBuffer>>
+            message_buffer, // This will be None if producer_only or no prefetch_config
             prefetch_task: Arc::new(Mutex::new(None)),
             scaling_task: Arc::new(Mutex::new(None)),
             consumer_factory,
@@ -143,42 +162,58 @@ where
             marker: PhantomData,
         };
 
-        // Start the prefetch task only if prefetch_config is Some (and thus message_buffer is Some)
-        if options.prefetch_config.is_some() {
+        // Start the prefetch task only if prefetch_config is Some AND NOT producer_only
+        if !queue.options.producer_only && queue.options.prefetch_config.is_some() {
+            // Ensure message_buffer is Some if prefetch_config is Some and not producer_only
+            if queue.message_buffer.is_none() {
+                // This case should ideally not be reached if logic above is correct
+                error!("Inconsistency: Prefetch configured but message_buffer is None.");
+
+                return Err(RmqError::ConfigError(
+                    "Internal error: Prefetch configured but message_buffer is None.".to_string(),
+                ));
+            }
             let prefetch_task = queue.start_prefetch_task().await;
             *queue.prefetch_task.lock().await = Some(prefetch_task);
         }
 
-        // Start the scaling task if configured
-        if queue
-            .options
-            .prefetch_config
-            .as_ref()
-            .map_or(false, |pc| pc.scaling.is_some())
+        // Start the scaling task if configured AND NOT producer_only
+        if !queue.options.producer_only
+            && queue
+                .options
+                .prefetch_config
+                .as_ref()
+                .map_or(false, |pc| pc.scaling.is_some())
         {
-            let scaling_task_handle = queue.start_scaling_task().await?;
-            *queue.scaling_task.lock().await = Some(scaling_task_handle);
+            if queue.consumer_factory.is_none() {
+                warn!("Scaling is configured, but no consumer factory provided. Scaling task will not start.");
+            } else if queue.scaling_strategy.is_none() {
+                warn!("Scaling is configured, but no scaling strategy provided. Scaling task will not start.");
+            } else if queue.message_buffer.is_none() {
+                warn!("Scaling is configured, but message buffer is not available (e.g. prefetching disabled). Scaling task will not start.");
+            } else {
+                let scaling_task_handle = queue.start_scaling_task().await?;
+                *queue.scaling_task.lock().await = Some(scaling_task_handle);
+            }
         }
 
-        // Start initial consumers if configured
-        if let Some(initial_count) = queue.options.initial_consumers {
-            if initial_count > 0 {
-                if let Some(factory) = &queue.consumer_factory {
-                    debug!("Starting {} initial consumers...", initial_count);
+        // Start initial consumers if configured AND NOT producer_only
+        if !queue.options.producer_only {
+            if let Some(initial_count) = queue.options.initial_consumers {
+                if initial_count > 0 {
+                    if let Some(factory) = &queue.consumer_factory {
+                        debug!("Starting {} initial consumers...", initial_count);
 
-                    if let Err(e) = queue.scale_up(initial_count, factory).await {
-                        error!("Failed to start initial consumers: {}", e);
-
-                        return Err(crate::errors::RmqError::ConfigError(format!(
-                            "Failed to start initial consumers: {}",
-                            e
-                        )));
+                        if let Err(e) = queue.scale_up(initial_count, factory).await {
+                            error!("Failed to start initial consumers: {}", e);
+                            // Don't return error, just log, as queue can still function for producing
+                        }
+                    } else {
+                        warn!(
+                            "Initial consumers configured ({}), but no consumer factory provided. Ignoring.",
+                            initial_count
+                        );
                     }
-                } else {
-                    warn!(
-                        "Initial consumers configured ({}), but no consumer factory provided. Ignoring.",
-                        initial_count
-                    );
                 }
             }
         }
@@ -646,6 +681,12 @@ where
 
     /// Adds a specified number of consumers to the queue.
     pub async fn add_consumers(&self, count: u32) -> RmqResult<()> {
+        if self.options.producer_only {
+            warn!("Attempted to add consumers to a producer-only queue. Operation ignored.");
+            return Err(RmqError::ConfigError(
+                "Cannot add consumers to a producer-only queue instance.".to_string(),
+            ));
+        }
         if count == 0 {
             return Ok(());
         }
@@ -662,6 +703,12 @@ where
     /// Removes a specified number of consumers from the queue.
     /// It will attempt to remove idle consumers first.
     pub async fn remove_consumers(&self, count: u32) -> RmqResult<()> {
+        if self.options.producer_only {
+            warn!("Attempted to remove consumers from a producer-only queue. Operation ignored.");
+            return Err(RmqError::ConfigError(
+                "Cannot remove consumers from a producer-only queue instance.".to_string(),
+            ));
+        }
         if count == 0 {
             return Ok(());
         }
@@ -679,6 +726,12 @@ where
     where
         C: Consumer<Message = M>,
     {
+        if self.options.producer_only {
+            warn!("Attempted to register a consumer on a producer-only queue. Operation ignored.");
+            return Err(RmqError::ConfigError(
+                "Cannot register a consumer on a producer-only queue instance.".to_string(),
+            ));
+        }
         let id = Uuid::now_v7();
 
         // Spawn the consumer task as a method on Queue
