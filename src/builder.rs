@@ -156,9 +156,7 @@ where
 
     /// Set the prefetch count - how many messages to prefetch from Redis
     ///
-    /// - A value of 1 disables prefetching (direct Redis polling)
-    /// - Values above 1 enable prefetching with the specified batch size
-    /// - Higher values reduce CPU usage with many consumers
+    /// Higher values reduce CPU usage with many consumers
     ///
     /// This initializes or updates the prefetch configuration.
     pub fn prefetch_count(mut self, count: u32) -> Self {
@@ -305,6 +303,26 @@ where
         } else {
             self.options.auto_recovery = None;
         }
+
+        self
+    }
+
+    /// Disables message prefetching for this queue instance.
+    ///
+    /// When prefetching is disabled:
+    /// - Each consumer will poll Redis directly for messages.
+    /// - This may increase Redis load and CPU usage compared to prefetching,
+    ///   especially with many consumers.
+    /// - Auto-scaling will be disabled, as it relies on the prefetching mechanism.
+    /// - Any previous calls to `.prefetch_count()`, `.buffer_size()`, or `.scaling_config()`
+    ///   will have their effects nullified. Subsequent calls to those methods will
+    ///   re-enable prefetching with the specified configurations.
+    ///
+    /// This is intended for consuming queues where direct polling is preferred.
+    /// For queues that only produce messages, use `.producer_only(true)` which also
+    /// disables prefetching along with all other consumer functionalities.
+    pub fn disable_prefetch(mut self) -> Self {
+        self.options.prefetch_config = None;
 
         self
     }

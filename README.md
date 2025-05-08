@@ -434,6 +434,30 @@ let queue = QueueBuilder::<String>::new()
     .await?;
 ```
 
+To disable prefetching for a consuming queue using the builder (forcing consumers to poll Redis directly):
+
+```rust
+use rmq::QueueBuilder;
+
+// #[tokio::main]
+// async fn main() -> eyre::Result<()> {
+let queue_no_prefetch = QueueBuilder::<String>::new()
+    .url("redis://127.0.0.1:6379")
+    .stream("my_direct_poll_stream")
+    .group("my_direct_poll_group")
+    .disable_prefetch() // Explicitly disable prefetching
+    // .initial_consumers(3) // Consumers will poll Redis directly
+    // .with_factory(my_consumer_factory)
+    .build()
+    .await?;
+
+// queue_no_prefetch.shutdown(None).await?;
+// Ok(())
+// }
+```
+
+Disabling prefetching means that auto-scaling will also be disabled, as it relies on the prefetching mechanism. If you intend for a queue instance to only produce messages, use `.producer_only(true)` which also disables prefetching along with all other consumer-related functionalities.
+
 #### Prefetching Performance Characteristics:
 
 - **CPU Usage**: Significantly lower (20-40% reduction observed in tests) - especially valuable with many consumers.

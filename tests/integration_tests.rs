@@ -3978,7 +3978,9 @@ async fn setup_producer_only_test_environment(test_name: &str) -> (Arc<Client>, 
 
 // Dummy consumer and factory for tests that might need them
 // Uses the existing TestMessage struct from integration_tests.rs
+#[derive(Clone)]
 struct ProducerOnlyTestConsumer; // Shortened name for "Producer-Only Test Consumer"
+
 #[async_trait]
 impl Consumer for ProducerOnlyTestConsumer {
     type Message = TestMessage;
@@ -4277,6 +4279,200 @@ async fn test_po_direct_queue_new_producer_only_with_conflicting_factory() -> ey
         queue.consumer_count(),
         0,
         "Consumers should not start if producer_only, despite factory and initial_consumers"
+    );
+
+    queue.shutdown(Some(100)).await;
+    client.del::<(), _>(&[&stream_name]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_builder_disable_prefetch_basic() -> eyre::Result<()> {
+    let (client, stream_name, group_name) = setup_producer_only_test_environment("dp_basic").await; // dp for disable_prefetch
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(&stream_name)
+        .group(&group_name)
+        .disable_prefetch()
+        .initial_consumers(1)
+        .with_instance(ProducerOnlyTestConsumer {})
+        .build()
+        .await?;
+
+    sleep(Duration::from_millis(100)).await; // Give consumer time to start
+
+    assert_eq!(
+        queue.consumer_count(),
+        1,
+        "Initial consumer should start even with prefetch disabled"
+    );
+
+    // Basic produce/consume check
+    let msg_content = "disable_prefetch_basic_message".to_string();
+    queue
+        .produce(&TestMessage {
+            content: msg_content.clone(),
+        })
+        .await?;
+
+    // To verify consumption, we'd ideally have a consumer that signals back.
+    // For simplicity here, we assume if no errors, it's okay.
+    // A more robust test would involve checking if the message is processed.
+    // For now, we're primarily testing queue construction and consumer startup.
+
+    queue.shutdown(Some(100)).await;
+    client.del::<(), _>(&[&stream_name]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_builder_disable_prefetch_disables_autoscaling() -> eyre::Result<()> {
+    let (client, stream_name, group_name) =
+        setup_producer_only_test_environment("dp_no_autoscaling").await;
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(&stream_name)
+        .group(&group_name)
+        .disable_prefetch() // Prefetch disabled
+        .initial_consumers(1)
+        .with_instance(ProducerOnlyTestConsumer {})
+        // Attempt to configure scaling - should have no effect due to disabled prefetch
+        .scaling_config(1, 3, 500) // min 1, max 3, interval 0.5s
+        .build()
+        .await?;
+
+    assert_eq!(
+        queue.consumer_count(),
+        1,
+        "Should start with initial_consumers"
+    );
+
+    // Produce messages to potentially trigger scaling if it were active
+    for i in 0..10 {
+        queue
+            .produce(&TestMessage {
+                content: format!("msg_{}", i),
+            })
+            .await?;
+    }
+
+    // Wait for a period longer than several scaling intervals
+    sleep(Duration::from_secs(2)).await;
+
+    // Consumer count should NOT have changed due to auto-scaling because prefetch is off
+    assert_eq!(
+        queue.consumer_count(),
+        1,
+        "Consumer count should not change as auto-scaling is inactive"
+    );
+
+    queue.shutdown(Some(100)).await;
+    client.del::<(), _>(&[&stream_name]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_builder_disable_prefetch_then_reenable_allows_autoscaling() -> eyre::Result<()> {
+    let (client, stream_name, group_name) =
+        setup_producer_only_test_environment("dp_reenable_autoscaling").await;
+    let processed_counter = Arc::new(AtomicU32::new(0)); // Add a counter for SimpleDelayedConsumer
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(&stream_name)
+        .group(&group_name)
+        .disable_prefetch() // Disable prefetch initially
+        .initial_consumers(1)
+        .with_instance(SimpleDelayedConsumer {
+            delay_ms: 100, // Introduce a 100ms processing delay
+            processed_count: processed_counter.clone(),
+        })
+        // Now re-enable prefetch by setting prefetch/scaling config
+        .prefetch_count(5) // This re-enables prefetch
+        .buffer_size(2) // And sets buffer size
+        .scaling_config(1, 3, 500) // min 1, max 3, interval 0.5s
+        .build()
+        .await?;
+
+    assert_eq!(
+        queue.consumer_count(),
+        1,
+        "Should start with initial_consumers"
+    );
+
+    // Produce messages to trigger scaling
+    for i in 0..20 {
+        // Produce more messages to ensure backlog
+        queue
+            .produce(&TestMessage {
+                content: format!("msg_scale_{}", i),
+            })
+            .await?;
+
+        sleep(Duration::from_millis(10)).await; // Small delay to allow processing
+    }
+
+    // Wait for scaling to occur
+    sleep(Duration::from_secs(1)).await; // Wait longer for scaling
+
+    // Consumer count should have increased due to auto-scaling
+    let final_consumer_count = queue.consumer_count();
+
+    assert!(
+        final_consumer_count > 1 && final_consumer_count <= 3,
+        "Consumer count should scale up (current: {})",
+        final_consumer_count
+    );
+
+    queue.shutdown(Some(100)).await;
+    client.del::<(), _>(&[&stream_name]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_builder_enable_prefetch_then_disable_prevents_autoscaling() -> eyre::Result<()> {
+    let (client, stream_name, group_name) =
+        setup_producer_only_test_environment("dp_enable_then_disable_autoscaling").await;
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(&stream_name)
+        .group(&group_name)
+        .initial_consumers(1)
+        .with_instance(ProducerOnlyTestConsumer {})
+        .prefetch_count(5) // Enable prefetch
+        .buffer_size(2)
+        .scaling_config(1, 3, 500) // Configure scaling
+        .disable_prefetch() // Then disable prefetch again
+        .build()
+        .await?;
+
+    assert_eq!(
+        queue.consumer_count(),
+        1,
+        "Should start with initial_consumers"
+    );
+
+    for i in 0..10 {
+        queue
+            .produce(&TestMessage {
+                content: format!("msg_{}", i),
+            })
+            .await?;
+    }
+
+    sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        queue.consumer_count(),
+        1,
+        "Consumer count should not change as prefetch was disabled last"
     );
 
     queue.shutdown(Some(100)).await;
