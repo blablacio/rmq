@@ -204,7 +204,11 @@ where
                     if let Some(factory) = &queue.consumer_factory {
                         debug!("Starting {} initial consumers...", initial_count);
 
-                        if let Err(e) = queue.scale_up(initial_count, factory).await {
+                        // Use factory.as_ref() to pass &(dyn Fn()...)
+                        if let Err(e) = queue
+                            .scale_up_with_factory(initial_count, factory.as_ref())
+                            .await
+                        {
                             error!("Failed to start initial consumers: {}", e);
                             // Don't return error, just log, as queue can still function for producing
                         }
@@ -450,7 +454,8 @@ where
                                 if actual_count > 0 {
                                     debug!("Scaling up by {} consumers", actual_count);
 
-                                    if let Err(e) = queue_clone.scale_up(actual_count, &factory).await {
+                                    // Use factory.as_ref() to pass &(dyn Fn()...)
+                                    if let Err(e) = queue_clone.scale_up_with_factory(actual_count, factory.as_ref()).await {
                                         error!("Failed to scale up: {}", e);
                                     }
                                 }
@@ -483,24 +488,64 @@ where
         Ok(handle)
     }
 
-    async fn scale_up(
-        &self,
-        count: u32,
-        factory: &Arc<dyn Fn() -> Arc<dyn Consumer<Message = M>> + Send + Sync>,
-    ) -> RmqResult<()> {
-        debug!("Attempting to scale up by {} consumers", count);
+    async fn scale_up_with_factory<F>(&self, count: u32, factory: &F) -> RmqResult<()>
+    where
+        F: Fn() -> Arc<dyn Consumer<Message = M>> + Send + Sync + ?Sized,
+    {
+        debug!(
+            "Attempting to scale up by {} consumers using factory",
+            count
+        );
 
         for _ in 0..count {
-            let new_consumer = factory();
+            let new_consumer_arc = factory(); // Call the factory
             let id = Uuid::now_v7();
 
-            match self.start_consumer(new_consumer).await {
+            match self.start_consumer(new_consumer_arc).await {
                 Ok(task_state) => {
                     self.tasks.insert(id, task_state);
-                    debug!("Successfully added consumer {}", id);
+                    debug!("Successfully added consumer task {}", id);
                 }
                 Err(e) => {
-                    error!("Failed to start new consumer during scale up: {}", e);
+                    error!("Failed to start new consumer task during scale up: {}", e);
+                    // Continue trying to add other consumers
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // New method for scaling with a single shared instance
+    async fn scale_up_with_instance(
+        &self,
+        count: u32,
+        instance: Arc<dyn Consumer<Message = M>>,
+    ) -> RmqResult<()> {
+        debug!(
+            "Attempting to scale up by {} consumers using a shared instance",
+            count
+        );
+
+        if count == 0 {
+            return Ok(());
+        }
+
+        for _ in 0..count {
+            let consumer_arc_clone = Arc::clone(&instance); // Clone Arc for each new task
+            let id = Uuid::now_v7();
+            match self.start_consumer(consumer_arc_clone).await {
+                Ok(task_state) => {
+                    self.tasks.insert(id, task_state);
+                    debug!(
+                        "Successfully added consumer task {} (sharing instance logic)",
+                        id
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to start new consumer task (sharing instance logic): {}",
+                        e
+                    );
                 }
             }
         }
@@ -679,7 +724,12 @@ where
         }
     }
 
-    /// Adds a specified number of consumers to the queue.
+    /// Adds a specified number of consumers to the queue using the default factory
+    /// configured during `QueueBuilder`.
+    ///
+    /// If no default factory is configured, this method will return an error.
+    /// Consider using `add_consumers_with_factory` or `add_consumers_with_instance`
+    /// if you need to provide the factory/instance at call time.
     pub async fn add_consumers(&self, count: u32) -> RmqResult<()> {
         if self.options.producer_only {
             warn!("Attempted to add consumers to a producer-only queue. Operation ignored.");
@@ -687,17 +737,111 @@ where
                 "Cannot add consumers to a producer-only queue instance.".to_string(),
             ));
         }
+
         if count == 0 {
             return Ok(());
         }
 
-        let factory = self.consumer_factory.clone().ok_or_else(|| {
-            RmqError::ConfigError("Consumer factory must be provided to add consumers.".to_string())
+        let factory_arc = self.consumer_factory.clone().ok_or_else(|| {
+            RmqError::ConfigError("Default consumer factory not configured for this queue. Use `add_consumers_with_factory` or `add_consumers_with_instance`, or provide a factory during QueueBuilder setup.".to_string())
         })?;
 
-        debug!("Attempting to add {} consumers via add_consumers", count);
+        debug!(
+            "Attempting to add {} consumers via add_consumers (using default factory)",
+            count
+        );
 
-        self.scale_up(count, &factory).await
+        self.scale_up_with_factory(count, factory_arc.as_ref())
+            .await
+    }
+
+    /// Adds a specified number of consumers to the queue using the provided factory function.
+    ///
+    /// This method is useful when the consumer factory could not be provided at build time,
+    /// or when you want to use a specific factory for this operation, overriding any
+    /// default factory set on the queue.
+    ///
+    /// The provided `factory_fn` should return a new instance of your consumer type.
+    ///
+    /// # Arguments
+    /// * `count` - The number of consumers to add.
+    /// * `factory_fn` - A function or closure that returns an instance of your consumer type `C`.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// queue.add_consumers_with_factory(3, || MyConsumer::new()).await?;
+    /// ```
+    pub async fn add_consumers_with_factory<F, C>(&self, count: u32, factory_fn: F) -> RmqResult<()>
+    where
+        F: Fn() -> C + Send + Sync + 'static, // Accepts Fn() -> C
+        C: Consumer<Message = M> + Send + Sync + 'static, // C is the concrete consumer
+    {
+        if self.options.producer_only {
+            warn!("Attempted to add consumers to a producer-only queue (using add_consumers_with_factory). Operation ignored.");
+            return Err(RmqError::ConfigError(
+                "Cannot add consumers to a producer-only queue instance.".to_string(),
+            ));
+        }
+
+        if count == 0 {
+            return Ok(());
+        }
+
+        debug!(
+            "Attempting to add {} consumers via add_consumers_with_factory",
+            count
+        );
+
+        // Wrap the user's factory_fn to match the type expected by scale_up_with_factory
+        // This is the same wrapping logic as in QueueBuilder::with_factory
+        let wrapped_factory = move || {
+            let consumer_instance: C = factory_fn();
+            Arc::new(consumer_instance) as Arc<dyn Consumer<Message = M>>
+        };
+
+        // scale_up_with_factory expects a reference to a Fn that returns Arc<dyn Consumer>
+        self.scale_up_with_factory(count, &wrapped_factory).await
+    }
+
+    /// Adds a specified number of consumers to the queue using the provided shared instance.
+    /// All `count` consumers will share the same `Arc`-wrapped instance.
+    ///
+    /// This method is useful when you have a pre-existing consumer instance that you want
+    /// to use for multiple consumer tasks.
+    ///
+    /// # Arguments
+    /// * `count` - The number of consumers to add.
+    /// * `instance` - An `Arc` to a specific consumer instance.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let shared_instance = Arc::new(MySharedConsumer::new());
+    /// queue.add_consumers_with_instance(2, shared_instance).await?;
+    /// ```
+    pub async fn add_consumers_with_instance<C>(&self, count: u32, instance: C) -> RmqResult<()>
+    where
+        C: Consumer<Message = M> + Send + Sync + 'static,
+    {
+        if self.options.producer_only {
+            warn!("Attempted to add consumers to a producer-only queue (using add_consumers_with_instance). Operation ignored.");
+            return Err(RmqError::ConfigError(
+                "Cannot add consumers to a producer-only queue instance.".to_string(),
+            ));
+        }
+
+        if count == 0 {
+            return Ok(());
+        }
+
+        debug!(
+            "Attempting to add {} consumers via add_consumers_with_instance",
+            count
+        );
+
+        // Wrap the concrete instance in Arc and cast to Arc<dyn Consumer<...>>
+        let wrapped_instance = Arc::new(instance) as Arc<dyn Consumer<Message = M>>;
+
+        self.scale_up_with_instance(count, wrapped_instance).await
     }
 
     /// Removes a specified number of consumers from the queue.
@@ -709,6 +853,7 @@ where
                 "Cannot remove consumers from a producer-only queue instance.".to_string(),
             ));
         }
+
         if count == 0 {
             return Ok(());
         }

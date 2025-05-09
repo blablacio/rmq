@@ -527,19 +527,44 @@ The `initial_consumers` option requires that you also provide a consumer factory
 
 ### Manual Consumer Scaling
 
-In addition to auto-scaling, you can manually control the number of consumers using the `add_consumers` and `remove_consumers` methods:
+In addition to auto-scaling, you can manually control the number of consumers. This is useful for scenarios where consumer counts are controlled by external configuration or when you want to implement your own scaling logic based on application-specific metrics.
 
-```rust
-// Add 3 more consumers
-queue.add_consumers(3).await?;
+**rmq** provides flexible ways to add consumers:
 
-// Remove 2 consumers
-queue.remove_consumers(2).await?;
-```
+- **`add_consumers(count: u32)`**: Adds a specified number of consumers using the default consumer factory configured for the queue (via `QueueBuilder::with_factory` or `QueueBuilder::with_instance`). This method requires a default factory to be set up beforehand.
 
-This is useful for scenarios where consumer counts are controlled by external configuration or when you want to implement your own scaling logic based on application-specific metrics.
+  ```rust
+  // Assumes a default factory was provided when building the queue
+  queue.add_consumers(3).await?;
+  ```
 
-When removing consumers, the queue will prioritize removing idle consumers first to minimize disruption to ongoing processing.
+- **`add_consumers_with_factory(count: u32, factory_fn: F)`**: Adds consumers using a provided ad-hoc factory function. The `factory_fn` should be a function or closure that takes no arguments and returns a new consumer instance (e.g., `|| MyConsumer::new()`). This allows for dynamic or specialized consumer creation without relying on a pre-configured default factory.
+
+  ```rust
+  let my_custom_factory = || {
+      // Custom logic to create a consumer instance
+      MySpecialConsumer::new(/* ...params... */)
+  };
+  queue.add_consumers_with_factory(2, my_custom_factory).await?;
+  ```
+
+- **`add_consumers_with_instance(count: u32, instance: C)`**: Adds a specified number of consumers, all of which will share the single provided `instance`. The `instance` is your concrete consumer type. It will be wrapped in an `Arc` internally, and this `Arc` will be cloned for each new consumer task. This is useful when you have a pre-existing, shareable consumer instance and want to scale it out.
+
+  ```rust
+  let my_shared_consumer = MySharedConsumer::new(); // Pass the concrete instance
+  queue.add_consumers_with_instance(4, my_shared_consumer).await?;
+  ```
+
+You can also remove consumers:
+
+- **`remove_consumers(count: u32)`**: Reduces the number of active consumers.
+
+  ```rust
+  // Remove 2 consumers
+  queue.remove_consumers(2).await?;
+  ```
+
+When removing consumers, the queue will prioritize removing idle consumers first to minimize disruption to ongoing processing. If adding consumers fails (e.g., due to a configuration error like trying to add consumers to a producer-only queue, or if a required factory is missing), an appropriate `RmqError` will be returned.
 
 ### Auto-Scaling
 

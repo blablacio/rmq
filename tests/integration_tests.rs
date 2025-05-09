@@ -12,12 +12,13 @@ use std::{
     error::Error,
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
 use tokio::{sync::Mutex, time::sleep};
+use uuid::Uuid;
 
 fn get_redis_url() -> String {
     std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string())
@@ -4477,6 +4478,193 @@ async fn test_builder_enable_prefetch_then_disable_prevents_autoscaling() -> eyr
 
     queue.shutdown(Some(100)).await;
     client.del::<(), _>(&[&stream_name]).await?;
+
+    Ok(())
+}
+
+// --- Tests for add_consumers variants ---
+
+#[derive(Clone)]
+struct CountingFactoryConsumer {}
+
+impl CountingFactoryConsumer {
+    fn new(factory_invocations_tracker: Arc<AtomicUsize>) -> Self {
+        // Increment when an instance is created by a factory
+        factory_invocations_tracker.fetch_add(1, Ordering::SeqCst);
+        Self {}
+    }
+}
+
+#[async_trait]
+impl Consumer for CountingFactoryConsumer {
+    type Message = TestMessage; // Use the existing TestMessage
+
+    async fn process(&self, delivery: &Delivery<Self::Message>) -> Result<(), ConsumerError> {
+        // For these specific tests, we mainly care about consumer creation and factory invocation.
+        // Acknowledging the message prevents it from being re-delivered if tests are slow or if other issues occur.
+        delivery.ack().await?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_add_consumers_with_factory_success() -> eyre::Result<()> {
+    let client_config = Config::from_url(&get_redis_url())?;
+    let client = Client::new(client_config, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+
+    let stream_name = format!("test_ac_wfs_v2_{}", Uuid::now_v7().as_simple());
+    let group_name = format!("test_ac_wfs_v2_group_{}", Uuid::now_v7().as_simple());
+    // QueueBuilder will create the group if it doesn't exist.
+
+    let queue = QueueBuilder::<TestMessage>::new() // Queue can be built without a default factory
+        .client(client.clone())
+        .stream(&stream_name)
+        .group(&group_name)
+        .build()
+        .await?;
+
+    let adhoc_factory_invocations = Arc::new(AtomicUsize::new(0));
+    let adhoc_factory_invocations_clone = adhoc_factory_invocations.clone();
+    let adhoc_factory =
+        move || CountingFactoryConsumer::new(adhoc_factory_invocations_clone.clone());
+
+    assert_eq!(queue.consumer_count(), 0);
+    let result = queue.add_consumers_with_factory(2, adhoc_factory).await;
+    assert!(
+        result.is_ok(),
+        "add_consumers_with_factory failed: {:?}",
+        result.err()
+    );
+    assert_eq!(queue.consumer_count(), 2);
+    assert_eq!(
+        adhoc_factory_invocations.load(Ordering::SeqCst),
+        2,
+        "Ad-hoc factory should be invoked 2 times"
+    );
+
+    queue.shutdown(Some(100)).await;
+
+    let _ = client.del::<(), _>(&stream_name).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_add_consumers_with_factory_on_producer_only_fails() -> eyre::Result<()> {
+    let client_config = Config::from_url(&get_redis_url())?;
+    let client = Client::new(client_config, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+
+    let stream_name = format!("test_ac_wfpo_v2_{}", Uuid::now_v7().as_simple());
+    let group_name = format!("test_ac_wfpo_v2_group_{}", Uuid::now_v7().as_simple());
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(&stream_name)
+        .group(&group_name)
+        .producer_only(true)
+        .build()
+        .await?;
+
+    let adhoc_factory_invocations = Arc::new(AtomicUsize::new(0));
+    let adhoc_factory = move || CountingFactoryConsumer::new(adhoc_factory_invocations.clone());
+
+    let result = queue.add_consumers_with_factory(2, adhoc_factory).await;
+    assert!(
+        matches!(result, Err(rmq::RmqError::ConfigError(_))),
+        "Expected ConfigError for producer-only queue"
+    );
+    assert_eq!(queue.consumer_count(), 0);
+
+    queue.shutdown(Some(100)).await;
+
+    let _ = client.del::<(), _>(&stream_name).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_add_consumers_with_instance_success() -> eyre::Result<()> {
+    let client_config = Config::from_url(&get_redis_url())?;
+    let client = Client::new(client_config, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+
+    let stream_name = format!("test_ac_wis_v2_{}", Uuid::now_v7().as_simple());
+    let group_name = format!("test_ac_wis_v2_group_{}", Uuid::now_v7().as_simple());
+
+    let queue = QueueBuilder::<TestMessage>::new() // Queue can be built without a default factory/instance
+        .client(client.clone())
+        .stream(&stream_name)
+        .group(&group_name)
+        .build()
+        .await?;
+
+    // This tracker will be incremented once when CountingFactoryConsumer::new is called.
+    let instance_creation_tracker = Arc::new(AtomicUsize::new(0));
+    let shared_instance = CountingFactoryConsumer::new(instance_creation_tracker.clone());
+    // instance_creation_tracker should be 1 after this line.
+
+    assert_eq!(queue.consumer_count(), 0);
+    let result = queue.add_consumers_with_instance(4, shared_instance).await;
+    assert!(
+        result.is_ok(),
+        "add_consumers_with_instance failed: {:?}",
+        result.err()
+    );
+    assert_eq!(queue.consumer_count(), 4);
+    // Verify that the original factory tracker was only incremented once when shared_instance was created.
+    assert_eq!(
+        instance_creation_tracker.load(Ordering::SeqCst),
+        1,
+        "Shared instance should only be 'created' (via its own new method) once"
+    );
+
+    queue.shutdown(Some(100)).await;
+
+    let _ = client.del::<(), _>(&stream_name).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_add_consumers_with_instance_on_producer_only_fails() -> eyre::Result<()> {
+    let client_config = Config::from_url(&get_redis_url())?;
+    let client = Client::new(client_config, None, None, None);
+    client.connect();
+    client.wait_for_connect().await?;
+    let client = Arc::new(client);
+
+    let stream_name = format!("test_ac_wipo_v2_{}", Uuid::now_v7().as_simple());
+    let group_name = format!("test_ac_wipo_v2_group_{}", Uuid::now_v7().as_simple());
+
+    let queue = QueueBuilder::<TestMessage>::new()
+        .client(client.clone())
+        .stream(&stream_name)
+        .group(&group_name)
+        .producer_only(true)
+        .build()
+        .await?;
+
+    let instance_creation_tracker = Arc::new(AtomicUsize::new(0));
+    let shared_instance = CountingFactoryConsumer::new(instance_creation_tracker.clone());
+
+    let result = queue.add_consumers_with_instance(4, shared_instance).await;
+    assert!(
+        matches!(result, Err(rmq::RmqError::ConfigError(_))),
+        "Expected ConfigError for producer-only queue"
+    );
+    assert_eq!(queue.consumer_count(), 0);
+
+    queue.shutdown(Some(100)).await;
+
+    let _ = client.del::<(), _>(&stream_name).await;
 
     Ok(())
 }
