@@ -79,38 +79,61 @@ where
     /// For more fine-grained control, use the individual setter methods instead.
     pub fn options(mut self, options: QueueOptions) -> Self {
         let existing = self.options; // Current options set by builder methods
-        let default_options = QueueOptions::default();
+        let defaults = QueueOptions::default();
 
-        // Update with provided options, but preserve any explicitly set values
         self.options = QueueOptions {
-            // For simple Option<T> fields, use existing value if it's Some, otherwise use new value
-            initial_consumers: existing.initial_consumers.or(options.initial_consumers),
-            pending_timeout: existing.pending_timeout.or(options.pending_timeout),
-            poll_interval: existing.poll_interval.or(options.poll_interval),
-            retry_config: existing.retry_config.or(options.retry_config),
-            dlq_name: existing.dlq_name.or(options.dlq_name),
-            auto_recovery: existing.auto_recovery.or(options.auto_recovery),
-
-            prefetch_config: match (existing.prefetch_config, options.prefetch_config) {
-                (Some(config), _) => Some(config), // If existing has value, preserve it
-                (None, new_config) => new_config,  // Otherwise use the new value
+            initial_consumers: if existing.initial_consumers != defaults.initial_consumers {
+                existing.initial_consumers
+            } else {
+                options.initial_consumers
             },
-
-            retry_sync: if existing.retry_sync != default_options.retry_sync {
+            pending_timeout: if existing.pending_timeout != defaults.pending_timeout {
+                existing.pending_timeout
+            } else {
+                options.pending_timeout
+            },
+            poll_interval: if existing.poll_interval != defaults.poll_interval {
+                existing.poll_interval
+            } else {
+                options.poll_interval
+            },
+            retry_config: if existing.retry_config != defaults.retry_config {
+                existing.retry_config
+            } else {
+                options.retry_config
+            },
+            dlq_name: if existing.dlq_name != defaults.dlq_name {
+                existing.dlq_name
+            } else {
+                options.dlq_name
+            },
+            auto_recovery: if existing.auto_recovery != defaults.auto_recovery {
+                existing.auto_recovery
+            } else {
+                options.auto_recovery
+            },
+            prefetch_config: if existing.prefetch_config != defaults.prefetch_config {
+                existing.prefetch_config
+            } else {
+                options.prefetch_config
+            },
+            // ... keep the existing logic for retry_sync, producer_only, delete_on_ack
+            // as it already matches this pattern and the documentation.
+            retry_sync: if existing.retry_sync != defaults.retry_sync {
                 existing.retry_sync
             } else {
                 options.retry_sync
             },
-
-            producer_only: if existing.producer_only != default_options.producer_only {
-                // Check if explicitly set
+            producer_only: if existing.producer_only != defaults.producer_only {
                 existing.producer_only
             } else {
                 options.producer_only
             },
-            delete_on_ack: options.delete_on_ack,
-            // Add other fields as needed
-            ..options
+            delete_on_ack: if existing.delete_on_ack != defaults.delete_on_ack {
+                existing.delete_on_ack
+            } else {
+                options.delete_on_ack
+            },
         };
 
         self

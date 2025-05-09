@@ -1013,7 +1013,7 @@ where
                             }
                         }
                     } else {
-                        // Traditional direct fetch for prefetch_count = 1
+                        // Traditional direct fetch for prefetch_count = None
                         let pending_timeout = if !auto_recovery_done && options.auto_recovery.is_some() {
                             auto_recovery_done = true;
 

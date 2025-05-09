@@ -4,20 +4,20 @@ impl QueueDefaults {
     pub const POLL_INTERVAL: u64 = 100; // Default poll interval in milliseconds
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct RetryConfig {
     pub max_retries: u32,
     pub retry_delay: u64, // in milliseconds
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct ScalingConfig {
     pub min_consumers: usize,
     pub max_consumers: usize,
     pub scale_interval: u64, // Milliseconds between scaling checks
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct PrefetchConfig {
     pub count: usize,
     pub buffer_size: usize,
