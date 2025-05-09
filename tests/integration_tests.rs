@@ -2124,7 +2124,7 @@ async fn test_prefetch_performance_comparison() -> eyre::Result<()> {
         group_name: &str,
         options: QueueOptions,
         message_count: u32,
-        consumer_count: u32,
+        consumer_count: usize,
         processing_delay_ms: u64,
     ) -> eyre::Result<(Duration, Vec<f32>)> {
         // Create queue

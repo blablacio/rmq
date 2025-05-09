@@ -531,14 +531,14 @@ In addition to auto-scaling, you can manually control the number of consumers. T
 
 **rmq** provides flexible ways to add consumers:
 
-- **`add_consumers(count: u32)`**: Adds a specified number of consumers using the default consumer factory configured for the queue (via `QueueBuilder::with_factory` or `QueueBuilder::with_instance`). This method requires a default factory to be set up beforehand.
+- **`add_consumers(count: usize)`**: Adds a specified number of consumers using the default consumer factory configured for the queue (via `QueueBuilder::with_factory` or `QueueBuilder::with_instance`). This method requires a default factory to be set up beforehand.
 
   ```rust
   // Assumes a default factory was provided when building the queue
   queue.add_consumers(3).await?;
   ```
 
-- **`add_consumers_with_factory(count: u32, factory_fn: F)`**: Adds consumers using a provided ad-hoc factory function. The `factory_fn` should be a function or closure that takes no arguments and returns a new consumer instance (e.g., `|| MyConsumer::new()`). This allows for dynamic or specialized consumer creation without relying on a pre-configured default factory.
+- **`add_consumers_with_factory(count: usize, factory_fn: F)`**: Adds consumers using a provided ad-hoc factory function. The `factory_fn` should be a function or closure that takes no arguments and returns a new consumer instance (e.g., `|| MyConsumer::new()`). This allows for dynamic or specialized consumer creation without relying on a pre-configured default factory.
 
   ```rust
   let my_custom_factory = || {
@@ -548,7 +548,7 @@ In addition to auto-scaling, you can manually control the number of consumers. T
   queue.add_consumers_with_factory(2, my_custom_factory).await?;
   ```
 
-- **`add_consumers_with_instance(count: u32, instance: C)`**: Adds a specified number of consumers, all of which will share the single provided `instance`. The `instance` is your concrete consumer type. It will be wrapped in an `Arc` internally, and this `Arc` will be cloned for each new consumer task. This is useful when you have a pre-existing, shareable consumer instance and want to scale it out.
+- **`add_consumers_with_instance(count: usize, instance: C)`**: Adds a specified number of consumers, all of which will share the single provided `instance`. The `instance` is your concrete consumer type. It will be wrapped in an `Arc` internally, and this `Arc` will be cloned for each new consumer task. This is useful when you have a pre-existing, shareable consumer instance and want to scale it out.
 
   ```rust
   let my_shared_consumer = MySharedConsumer::new(); // Pass the concrete instance
@@ -557,7 +557,7 @@ In addition to auto-scaling, you can manually control the number of consumers. T
 
 You can also remove consumers:
 
-- **`remove_consumers(count: u32)`**: Reduces the number of active consumers.
+- **`remove_consumers(count: usize)`**: Reduces the number of active consumers.
 
   ```rust
   // Remove 2 consumers
@@ -668,11 +668,11 @@ impl ScalingStrategy for MyCustomStrategy {
         if context.overflow_size > context.current_consumers * 10 {
             // Scale up faster if backlog is large
             let scale_up = (context.max_consumers - context.current_consumers).min(3);
-            ScaleAction::ScaleUp(scale_up as u32)
+            ScaleAction::ScaleUp(scale_up)
         } else if context.idle_consumers > context.current_consumers / 2 {
             // Scale down more aggressively if more than half consumers are idle
             let scale_down = context.idle_consumers.min(context.current_consumers - context.min_consumers);
-            ScaleAction::ScaleDown(scale_down as u32)
+            ScaleAction::ScaleDown(scale_down)
         } else {
             ScaleAction::Hold
         }

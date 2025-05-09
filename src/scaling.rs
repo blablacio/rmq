@@ -2,8 +2,8 @@ use async_trait::async_trait;
 
 #[derive(Debug)]
 pub enum ScaleAction {
-    ScaleUp(u32),   // Number of consumers to add
-    ScaleDown(u32), // Number of consumers to remove
+    ScaleUp(usize),   // Number of consumers to add
+    ScaleDown(usize), // Number of consumers to remove
     Hold,
 }
 
@@ -35,12 +35,12 @@ impl ScalingStrategy for DefaultScalingStrategy {
             // Scale up if buffer is overflowing, no consumers are idle, and not at max
             let scale_up_by = (context.max_consumers - context.current_consumers).min(1); // Example: scale up by 1
 
-            return ScaleAction::ScaleUp(scale_up_by as u32);
+            return ScaleAction::ScaleUp(scale_up_by);
         } else if context.current_consumers < context.min_consumers {
             // Ensure minimum consumers are running
             let scale_up_by = context.min_consumers - context.current_consumers;
 
-            return ScaleAction::ScaleUp(scale_up_by as u32);
+            return ScaleAction::ScaleUp(scale_up_by);
         }
 
         // --- Scale Down Logic (Modified) ---
@@ -56,7 +56,7 @@ impl ScalingStrategy for DefaultScalingStrategy {
                 .idle_consumers
                 .min(context.current_consumers - context.min_consumers);
 
-            return ScaleAction::ScaleDown(scale_down_by as u32);
+            return ScaleAction::ScaleDown(scale_down_by);
         }
 
         // --- Hold Logic ---

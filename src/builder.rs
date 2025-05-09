@@ -117,7 +117,7 @@ where
     }
 
     /// Set the initial number of consumers to start with
-    pub fn initial_consumers(mut self, count: u32) -> Self {
+    pub fn initial_consumers(mut self, count: usize) -> Self {
         self.options.initial_consumers = Some(count);
 
         self
@@ -159,7 +159,7 @@ where
     /// Higher values reduce CPU usage with many consumers
     ///
     /// This initializes or updates the prefetch configuration.
-    pub fn prefetch_count(mut self, count: u32) -> Self {
+    pub fn prefetch_count(mut self, count: usize) -> Self {
         let buffer_size = self.options.prefetch_config.as_ref().map_or(
             QueueOptions::default().prefetch_config.unwrap().buffer_size,
             |config| config.buffer_size,
@@ -198,8 +198,8 @@ where
     /// Requires a `consumer_factory` to be set.
     pub fn scaling_config(
         mut self,
-        min_consumers: u32,
-        max_consumers: u32,
+        min_consumers: usize,
+        max_consumers: usize,
         scale_interval: u64,
     ) -> Self {
         let mut config = self

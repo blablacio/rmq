@@ -12,30 +12,30 @@ pub struct RetryConfig {
 
 #[derive(Clone, Debug)]
 pub struct ScalingConfig {
-    pub min_consumers: u32,
-    pub max_consumers: u32,
+    pub min_consumers: usize,
+    pub max_consumers: usize,
     pub scale_interval: u64, // Milliseconds between scaling checks
 }
 
 #[derive(Clone, Debug)]
 pub struct PrefetchConfig {
-    pub count: u32,
+    pub count: usize,
     pub buffer_size: usize,
     pub scaling: Option<ScalingConfig>, // Optional scaling configuration
 }
 
 #[derive(Clone)]
 pub struct QueueOptions {
-    pub initial_consumers: Option<u32>, // Initial number of consumers
-    pub pending_timeout: Option<u64>,   // Timeout after which a message is reclaimed
+    pub initial_consumers: Option<usize>, // Initial number of consumers
+    pub pending_timeout: Option<u64>,     // Timeout after which a message is reclaimed
     pub retry_config: Option<RetryConfig>, // Retry configuration
-    pub poll_interval: Option<u64>,     // Interval for queue polling
-    pub dlq_name: Option<String>,       // Optional DLQ stream name
-    pub auto_recovery: Option<u64>,     // Automatically recover messages on startup after timeout
-    pub delete_on_ack: bool,            // Automatically delete messages from queue after ack
+    pub poll_interval: Option<u64>,       // Interval for queue polling
+    pub dlq_name: Option<String>,         // Optional DLQ stream name
+    pub auto_recovery: Option<u64>,       // Automatically recover messages on startup after timeout
+    pub delete_on_ack: bool,              // Automatically delete messages from queue after ack
     pub prefetch_config: Option<PrefetchConfig>, // Configuration for prefetching messages
-    pub retry_sync: RetrySyncPolicy,    // When to sync retry counts with Redis
-    pub producer_only: bool,            // Producer-only mode
+    pub retry_sync: RetrySyncPolicy,      // When to sync retry counts with Redis
+    pub producer_only: bool,              // Producer-only mode
 }
 
 #[derive(Clone, PartialEq)]

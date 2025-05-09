@@ -269,13 +269,13 @@ where
 
                         // Calculate the appropriate prefetch amount based on consumer count
                         // Use the count from the captured prefetch_config
-                        let effective_prefetch = prefetch_config.count + consumer_count as u32;
+                        let effective_prefetch = prefetch_config.count + consumer_count;
 
                         // Get current buffer state
                         let current_len = message_buffer.get_overflow_size().await;
 
                         // Only fetch more if there's space for a meaningful number of messages
-                        if current_len >= effective_prefetch as usize {
+                        if current_len >= effective_prefetch {
                             // If we skipped fetching because the buffer is full,
                             // try distributing existing overflow to potentially idle consumers.
                             message_buffer.distribute_overflow().await;
@@ -285,7 +285,7 @@ where
 
                         // Calculate how many messages to fetch to fill the buffer
                         // Ensure subtraction doesn't underflow
-                        let fetch_count = effective_prefetch.saturating_sub(current_len as u32);
+                        let fetch_count = effective_prefetch.saturating_sub(current_len);
 
                         // Ensure we only fetch if fetch_count is positive
                         if fetch_count == 0 {
@@ -327,7 +327,7 @@ where
 
                                     // If we got close to our requested batch size, check if we need to immediately
                                     // fetch more to keep the buffer full (don't wait for next interval)
-                                    if fetched_count >= (fetch_count as usize * 3/4) && fetched_count > 50 { // Check thresholds
+                                    if fetched_count >= (fetch_count * 3/4) && fetched_count > 50 { // Check thresholds
                                         interval.reset();
                                     }
                                 }
@@ -439,8 +439,8 @@ where
                             current_consumers,
                             idle_consumers,
                             overflow_size,
-                            min_consumers: scaling_config.min_consumers as usize,
-                            max_consumers: scaling_config.max_consumers as usize,
+                            min_consumers: scaling_config.min_consumers,
+                            max_consumers: scaling_config.max_consumers,
                         };
 
                         let action = strategy.decide(context).await;
@@ -449,12 +449,11 @@ where
                             ScaleAction::ScaleUp(count) => {
                                 let actual_count = std::cmp::min(
                                     count,
-                                    scaling_config.max_consumers.saturating_sub(current_consumers as u32)
+                                    scaling_config.max_consumers.saturating_sub(current_consumers)
                                 );
                                 if actual_count > 0 {
                                     debug!("Scaling up by {} consumers", actual_count);
 
-                                    // Use factory.as_ref() to pass &(dyn Fn()...)
                                     if let Err(e) = queue_clone.scale_up_with_factory(actual_count, factory.as_ref()).await {
                                         error!("Failed to scale up: {}", e);
                                     }
@@ -463,7 +462,7 @@ where
                             ScaleAction::ScaleDown(count) => {
                                 let actual_count = std::cmp::min(
                                     count,
-                                    (current_consumers as u32).saturating_sub(scaling_config.min_consumers)
+                                    current_consumers.saturating_sub(scaling_config.min_consumers)
                                 );
 
                                 if actual_count > 0 {
@@ -488,7 +487,7 @@ where
         Ok(handle)
     }
 
-    async fn scale_up_with_factory<F>(&self, count: u32, factory: &F) -> RmqResult<()>
+    async fn scale_up_with_factory<F>(&self, count: usize, factory: &F) -> RmqResult<()>
     where
         F: Fn() -> Arc<dyn Consumer<Message = M>> + Send + Sync + ?Sized,
     {
@@ -518,7 +517,7 @@ where
     // New method for scaling with a single shared instance
     async fn scale_up_with_instance(
         &self,
-        count: u32,
+        count: usize,
         instance: Arc<dyn Consumer<Message = M>>,
     ) -> RmqResult<()> {
         debug!(
@@ -553,7 +552,7 @@ where
         Ok(())
     }
 
-    async fn scale_down(&self, count: u32) -> RmqResult<()> {
+    async fn scale_down(&self, count: usize) -> RmqResult<()> {
         debug!("Attempting to scale down by {} consumers", count);
 
         let mut removed_count = 0;
@@ -562,7 +561,7 @@ where
             .iter()
             .filter(|entry| !entry.value().processing.load(Ordering::Relaxed))
             .map(|entry| *entry.key())
-            .take(count as usize)
+            .take(count)
             .collect();
 
         for key in idle_keys {
@@ -730,7 +729,7 @@ where
     /// If no default factory is configured, this method will return an error.
     /// Consider using `add_consumers_with_factory` or `add_consumers_with_instance`
     /// if you need to provide the factory/instance at call time.
-    pub async fn add_consumers(&self, count: u32) -> RmqResult<()> {
+    pub async fn add_consumers(&self, count: usize) -> RmqResult<()> {
         if self.options.producer_only {
             warn!("Attempted to add consumers to a producer-only queue. Operation ignored.");
             return Err(RmqError::ConfigError(
@@ -771,7 +770,11 @@ where
     /// ```rust,ignore
     /// queue.add_consumers_with_factory(3, || MyConsumer::new()).await?;
     /// ```
-    pub async fn add_consumers_with_factory<F, C>(&self, count: u32, factory_fn: F) -> RmqResult<()>
+    pub async fn add_consumers_with_factory<F, C>(
+        &self,
+        count: usize,
+        factory_fn: F,
+    ) -> RmqResult<()>
     where
         F: Fn() -> C + Send + Sync + 'static, // Accepts Fn() -> C
         C: Consumer<Message = M> + Send + Sync + 'static, // C is the concrete consumer
@@ -804,21 +807,22 @@ where
     }
 
     /// Adds a specified number of consumers to the queue using the provided shared instance.
-    /// All `count` consumers will share the same `Arc`-wrapped instance.
+    /// All `count` new consumer tasks will share this single `instance`.
     ///
     /// This method is useful when you have a pre-existing consumer instance that you want
-    /// to use for multiple consumer tasks.
+    /// to use for multiple consumer tasks. The provided `instance` will be wrapped in an `Arc`
+    /// internally, and this `Arc` will be cloned for each new consumer task.
     ///
     /// # Arguments
     /// * `count` - The number of consumers to add.
-    /// * `instance` - An `Arc` to a specific consumer instance.
+    /// * `instance` - A concrete consumer instance.
     ///
     /// # Example
     /// ```rust,ignore
-    /// let shared_instance = Arc::new(MySharedConsumer::new());
-    /// queue.add_consumers_with_instance(2, shared_instance).await?;
+    /// let my_shared_consumer = MySharedConsumer::new(); // The concrete instance
+    /// queue.add_consumers_with_instance(2, my_shared_consumer).await?;
     /// ```
-    pub async fn add_consumers_with_instance<C>(&self, count: u32, instance: C) -> RmqResult<()>
+    pub async fn add_consumers_with_instance<C>(&self, count: usize, instance: C) -> RmqResult<()>
     where
         C: Consumer<Message = M> + Send + Sync + 'static,
     {
@@ -846,7 +850,7 @@ where
 
     /// Removes a specified number of consumers from the queue.
     /// It will attempt to remove idle consumers first.
-    pub async fn remove_consumers(&self, count: u32) -> RmqResult<()> {
+    pub async fn remove_consumers(&self, count: usize) -> RmqResult<()> {
         if self.options.producer_only {
             warn!("Attempted to remove consumers from a producer-only queue. Operation ignored.");
             return Err(RmqError::ConfigError(
