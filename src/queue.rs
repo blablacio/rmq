@@ -128,10 +128,11 @@ where
             if let Some(config) = &options.prefetch_config {
                 // Validate scaling config dependency
                 if config.scaling.is_some() && consumer_factory.is_none() {
-                    return Err(crate::errors::RmqError::ConfigError(
+                    return Err(RmqError::ConfigError(
                         "Consumer factory must be provided when scaling is enabled".to_string(),
                     ));
                 }
+
                 Some(Arc::new(MessageBuffer::new(config.buffer_size)))
             } else {
                 None
@@ -173,6 +174,7 @@ where
                     "Internal error: Prefetch configured but message_buffer is None.".to_string(),
                 ));
             }
+
             let prefetch_task = queue.start_prefetch_task().await;
             *queue.prefetch_task.lock().await = Some(prefetch_task);
         }
@@ -385,26 +387,20 @@ where
             .as_ref()
             .and_then(|pc| pc.scaling.clone())
             .ok_or_else(|| {
-                crate::errors::RmqError::ConfigError(
+                RmqError::ConfigError(
                     "Attempted to start scaling task without scaling configuration".to_string(),
                 )
             })?;
 
         // Ensure necessary components are present
         let strategy = self.scaling_strategy.clone().ok_or_else(|| {
-            crate::errors::RmqError::ConfigError(
-                "Scaling strategy missing for scaling task".to_string(),
-            )
+            RmqError::ConfigError("Scaling strategy missing for scaling task".to_string())
         })?;
         let factory = self.consumer_factory.clone().ok_or_else(|| {
-            crate::errors::RmqError::ConfigError(
-                "Consumer factory missing for scaling task".to_string(),
-            )
+            RmqError::ConfigError("Consumer factory missing for scaling task".to_string())
         })?;
         let message_buffer = self.message_buffer.clone().ok_or_else(|| {
-            crate::errors::RmqError::ConfigError(
-                "Message buffer missing for scaling task".to_string(),
-            )
+            RmqError::ConfigError("Message buffer missing for scaling task".to_string())
         })?;
         let tasks = self.tasks.clone();
         let mut shutdown_rx = self.shutdown_rx.clone();

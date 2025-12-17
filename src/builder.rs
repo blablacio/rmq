@@ -117,8 +117,6 @@ where
             } else {
                 options.prefetch_config
             },
-            // ... keep the existing logic for retry_sync, producer_only, delete_on_ack
-            // as it already matches this pattern and the documentation.
             retry_sync: if existing.retry_sync != defaults.retry_sync {
                 existing.retry_sync
             } else {
